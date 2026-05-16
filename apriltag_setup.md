@@ -237,9 +237,9 @@ python calibrate_camera.py \
 
 # (3) 카메라 간 extrinsic
 python calibrate_extrinsic_two_cams.py \
-  --tag-id 1 \
+  --tag-id 0 \
   --tag-config config/tag_sizes.json \
-  --num-samples 200 \
+  --num-samples 100 \
   --width 960 --height 540 --fps 60
 ```
 
@@ -253,6 +253,35 @@ python calibrate_extrinsic_two_cams.py \
   - 여러 샘플 평균 + 회전행렬 재직교화(SVD) 후 저장
 - 산출물: `camera1_to_camera2_extrinsic.npz` (키: `T_c2_c1`, 시리얼, 샘플 수 등)
 - 주의: extrinsic 계산 시 스트림 해상도/FPS(`--width --height --fps`)를 실제 운영과 맞춰서 실행
+
+수학적 배경(왜 inverse가 가능한가):
+
+- AprilTag detector 원출력은 보통
+  - `pose_R`: `3x3` 회전행렬
+  - `pose_t`: `3x1` 이동벡터
+- `pose_t` 단독은 정방행렬이 아니므로 inverse를 직접 취하지 않는다.
+- 먼저 아래처럼 동차변환행렬(4x4)로 만든다 (`pose_to_T()`):
+
+  \[
+  T =
+  \begin{bmatrix}
+  R_{3x3} & t_{3x1}\\
+  0\ 0\ 0 & 1
+  \end{bmatrix}
+  \]
+
+- 그래서 `T_c1_tag`, `T_c2_tag`는 4x4 rigid transform이 되고 inverse가 가능하다.
+- rigid transform의 역변환은:
+
+  \[
+  T^{-1} =
+  \begin{bmatrix}
+  R^T & -R^T t\\
+  0\ 0\ 0 & 1
+  \end{bmatrix}
+  \]
+
+  (회전행렬은 직교행렬이므로 `R^{-1} = R^T`)
 
 왜 필요한가:
 
@@ -275,7 +304,12 @@ python calibrate_extrinsic_two_cams.py \
 검증:
 
 ```bash
-python detect_apriltag_two_cams_world.py
+python detect_apriltag_two_cams_world.py \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --extrinsic camera1_to_camera2_extrinsic.npz \
+  --tag-config config/tag_sizes.json \
+  --width 960 --height 540 --fps 60
 ```
 
 이 스크립트에서 camera2를 world로 두고 camera1 검출 결과를 world로 변환해 비교한다.
@@ -426,6 +460,83 @@ python detect_apriltag_two_cams_origin_fusion.py \
 - 융합 창 좌표가 단일 카메라보다 덜 튐
 - origin 태그 가림 상황에서도 최소 한 카메라가 유지되면 추정이 빠르게 복귀
 
+### 5-7. 우리가 쓰는 퓨전 알고리즘 (정확한 순서 + 개념)
+
+`detect_apriltag_two_cams_origin_fusion.py` 기준 실제 파이프라인:
+
+1. 각 카메라에서 같은 태그 ID의 pose 추정  
+   - cam1: `T_c1_tag`
+   - cam2: `T_c2_tag`
+2. cam1 pose를 cam2(world)로 변환  
+   - `T_c2_tag_from_cam1 = T_c2_c1 @ T_c1_tag`
+3. 같은 태그 ID끼리 후보를 모음 (cam1기반, cam2기반)
+4. 품질 가중치로 융합
+5. 마지막에 origin 태그 기준으로 상대변환  
+   - `T_origin_tag_i = inv(T_c2_tag_origin) @ T_c2_tag_i`
+
+즉, 지금 방식은 **행렬변환(extrinsic) + 가중 평균(fusion)** 조합이다.
+
+#### decision margin이 뭔가?
+
+- `pupil_apriltags`가 주는 검출 품질 지표 중 하나로, 태그 디코딩이 얼마나 확실한지 나타낸다.
+- 값이 클수록 일반적으로 검출 신뢰도가 높다.
+- 현재 스크립트는 이 값을 가중치로 사용해, 신뢰도 높은 카메라 결과에 더 큰 비중을 준다.
+
+#### 회전행렬 가중합 + SVD는 뭘 하나?
+
+- 위치(translation)는 벡터이므로 가중 평균을 바로 할 수 있다.
+- 회전(rotation)은 단순 평균하면 유효한 회전행렬이 깨질 수 있다.
+- 그래서:
+  1) 회전행렬들을 가중합
+  2) SVD로 가장 가까운 직교행렬로 재투영
+  3) det(+1) 조건을 맞춰 유효한 회전행렬로 복원
+
+이 과정을 통해 "회전 평균"을 실용적으로 계산한다.
+
+#### 순서가 헷갈리지 않도록 (운영 체크리스트)
+
+1. 카메라 intrinsics 고정 (`960x540@60`)  
+2. cam1->cam2 extrinsic(`T_c2_c1`) 계산  
+3. cam1 검출을 cam2(world)로 변환  
+4. 태그 ID별로 cam1/cam2 후보 융합  
+5. origin 태그 기준 상대좌표로 재표현  
+6. 필요한 경우 시간축 필터(EMA/Kalman) 추가
+
+### 5-8. 우리 방식의 위치와 필터(EMA/Kalman) 비교
+
+흔한 발전 단계:
+
+1) 단일 카메라  
+2) 다중 카메라 + 좌표계 통일 + 평균/가중 퓨전 (**현재 단계**)  
+3) outlier reject(카메라 간 불일치 큰 값 제거)  
+4) 시간축 필터(EMA/Kalman)  
+5) 고급 최적화(factor graph / bundle adjustment / VIO)
+
+현재 방식 장점:
+
+- 구현 단순
+- 디버그 쉬움
+- 실시간 적용이 빠름
+
+현재 방식 한계:
+
+- 한 카메라가 크게 틀리면 fused 결과도 끌려갈 수 있음
+- 시간축 연속성(velocity/acceleration)을 직접 모델링하지 않음
+
+EMA/Kalman을 쓰면 무조건 좋아지나?
+
+- 아니다. 상황에 따라 좋아질 수도, 나빠질 수도 있다.
+- EMA 장점: 구현 쉽고 노이즈 감소 효과 즉시 확인 가능  
+  단점: 지연(latency) 증가, 급변 동작 둔화
+- Kalman 장점: 상태모델 기반으로 dropout/노이즈 대응에 강함  
+  단점: 모델/잡음 공분산 튜닝이 어려우며, 튜닝 실패 시 오히려 왜곡 가능
+
+권장 적용 순서:
+
+- 먼저 현재 퓨전에 outlier reject를 붙이고,
+- 그다음 EMA를 소량 적용해 보고,
+- 필요 시 Kalman으로 확장한다.
+
 ---
 
 ## 6) 로봇 torso / 박스 pose 추정 파이프라인
@@ -524,6 +635,35 @@ python scripts/play.py replay sub8_largebox_045_original
 - OmniRetarget `processed/*.npz`의 `body_pos_w`, `object_pos_w`는 global/world 기준 값이다.
 - 따라서 시각화에서 로봇과 물체를 같은 global frame으로 동시에 확인해야,
   이후 실험실 origin 좌표계와 정합할 때 축/부호/오프셋 오류를 줄일 수 있다.
+
+### B-4. sub8_largebox_045 초기 기준 pose (frame 0)
+
+실험실 시작 위치를 맞출 때 참고할 기준값:
+
+- replay: `sub8_largebox_045_original`
+- frame: `0/283`
+- root_pos: `[-1.1321, +0.6698, +0.7982]`
+- root_quat: `[-0.7029, -0.0523, -0.0514, +0.7075]`
+- obj_pos: `[-1.1993, +0.3165, +0.1834]`
+- obj_quat: `[-0.0728, +0.9474, +0.3096, +0.0354]`
+
+메모:
+
+- 위 값은 replay에서 pause 상태(`frame 0`)에 출력한 `qpos` 기준이다.
+- 실험실에서 초기 세팅 시 완전 동일 숫자를 강제하기보다, 상대 배치(로봇-박스 거리/방향)와
+  원점 좌표계 정렬이 먼저 맞는지 확인한다.
+
+러프 해석(초기 frame 0):
+
+- 로봇 root 대비 물체 상대벡터(`obj_pos - root_pos`)는 대략
+  `[-0.067, -0.353, -0.615] m` 이다.
+- 해석하면 물체는 로봇 root 기준으로
+  - x축으로는 거의 비슷한 선상(약 6.7cm 차이),
+  - y축 음의 방향으로 약 35cm,
+  - z축으로는 약 61.5cm 아래에 있다.
+- 수평거리(평면)는 약 `0.36 m`, 3D 직선거리는 약 `0.71 m` 수준이다.
+- 쿼터니언(`root_quat`, `obj_quat`)은 부호 동치 특성이 있어 숫자만으로 직관 해석이 어렵다.
+  방향 비교는 replay에서 frame 축 시각화와 함께 보는 것을 권장한다.
 
 ---
 
