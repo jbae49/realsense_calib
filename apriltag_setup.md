@@ -665,6 +665,19 @@ python scripts/play.py replay sub8_largebox_045_original
 - 쿼터니언(`root_quat`, `obj_quat`)은 부호 동치 특성이 있어 숫자만으로 직관 해석이 어렵다.
   방향 비교는 replay에서 frame 축 시각화와 함께 보는 것을 권장한다.
 
+(참고) 현재 추적/계산하는 link/프레임 정리:
+
+- 실시간 AprilTag 파이프라인에서 "직접 관측"하는 것
+  - robot `head` 태그 (ID 예: 10)
+  - box 태그들 (ID 예: 0~5)
+- 실시간 AprilTag 파이프라인에서 "간접 계산"하는 것
+  - `torso_link`: `T_world_torso = T_world_headTag @ T_tag_torso`
+  - `box/object` pose: 다중 box 태그 + `box_tag_map`으로 계산
+- 즉, head는 현재 "head_link 자체를 직접 추적"하는 것이 아니라
+  "head에 붙인 태그를 직접 관측"하고, torso는 그 태그에서 변환으로 얻는다.
+- replay(OmniRetarget)에서는 `body_pos_w/body_quat_w`를 통해 로봇 body 상태를 재생하며,
+  운영 확인 단계에서는 보통 `root(pelvis)`, `torso_link`, `object`를 우선 점검한다.
+
 ---
 
 ## 7) 스무딩 전에 먼저 해야 할 시각화 테스트

@@ -13,21 +13,44 @@ Setup:
   - Tag on torso (chest): ROBOT_TORSO_TAG_ID (temporary, for validation only)
   - Single camera (cam2 = world)
 """
+import argparse
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 from pupil_apriltags import Detector
+from utils.apriltag_config import (
+    parse_tag_size_map,
+    load_tag_size_config,
+    merge_tag_sizes,
+    detect_with_tag_sizes,
+)
 
 # =========================================================
 # Config — EDIT THESE
 # =========================================================
 
-ROBOT_HEAD_TAG_ID = 10     # head tag ID (change to yours)
-ROBOT_TORSO_TAG_ID = 11    # temporary torso tag ID (change to yours)
-TAG_SIZE = 0.077            # meters
+parser = argparse.ArgumentParser()
+parser.add_argument("--head-tag-id", type=int, default=10)
+parser.add_argument("--torso-tag-id", type=int, default=11)
+parser.add_argument("--cam-serial", type=str, default="115222071236")
+parser.add_argument("--cam-calib", type=str, default="camera2_115222071236_calibration.npz")
+parser.add_argument("--tag-size", type=float, default=0.077, help="Default AprilTag size in meters")
+parser.add_argument("--tag-config", type=str, default="config/tag_sizes.json")
+parser.add_argument("--tag-size-map", type=str, default="")
+parser.add_argument("--width", type=int, default=960)
+parser.add_argument("--height", type=int, default=540)
+parser.add_argument("--fps", type=int, default=60)
+args = parser.parse_args()
 
-CAM_SERIAL = "115222071236"
-CAM_CALIB = "camera2_115222071236_calibration.npz"
+ROBOT_HEAD_TAG_ID = args.head_tag_id
+ROBOT_TORSO_TAG_ID = args.torso_tag_id
+CAM_SERIAL = args.cam_serial
+CAM_CALIB = args.cam_calib
+
+cfg_default_size, cfg_tag_size_map = load_tag_size_config(args.tag_config)
+tag_default = cfg_default_size if cfg_default_size is not None else args.tag_size
+cli_tag_size_map = parse_tag_size_map(args.tag_size_map)
+TAG_SIZE, TAG_SIZE_MAP = merge_tag_sizes(tag_default, cfg_tag_size_map, cli_tag_size_map)
 
 # =========================================================
 # URDF-based transform: tag(head) → torso_link
@@ -94,13 +117,15 @@ detector = Detector(
 pipeline = rs.pipeline()
 config = rs.config()
 config.enable_device(CAM_SERIAL)
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
 pipeline.start(config)
 
 print("======================================")
 print("VALIDATION: Head tag vs Torso tag")
 print(f"  Head tag ID:  {ROBOT_HEAD_TAG_ID}")
 print(f"  Torso tag ID: {ROBOT_TORSO_TAG_ID}")
+print(f"  stream:       {args.width}x{args.height}@{args.fps}")
+print(f"  tag config:   {args.tag_config}")
 print()
 print("Place both tags on robot, keep robot still.")
 print("Compare estimated vs actual torso position.")
@@ -116,8 +141,7 @@ try:
         img = np.asanyarray(frames.get_color_frame().get_data())
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        dets = detector.detect(gray, estimate_tag_pose=True,
-                               camera_params=cam_params, tag_size=TAG_SIZE)
+        dets = detect_with_tag_sizes(detector, gray, cam_params, TAG_SIZE, TAG_SIZE_MAP)
 
         T_cam_headtag = None
         T_cam_torsotag = None
