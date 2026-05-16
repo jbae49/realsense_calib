@@ -464,6 +464,12 @@ cd /home/roy/realsense_calib/humanoid_project
 python scripts/play.py replay sub8_largebox_045_original
 ```
 
+재생 조작키:
+
+- `Space`: pause / resume
+- `Right` 또는 `N`: 다음 프레임 1칸 (pause 상태에서)
+- `Left` 또는 `B`: 이전 프레임 1칸 (pause 상태에서)
+
 중요:
 
 - object가 안 보이면 replay 모드가 맞는지 먼저 확인 (`scripts/play.py replay ...`)
@@ -473,12 +479,28 @@ python scripts/play.py replay sub8_largebox_045_original
 
 ### B-2. MuJoCo GUI에서 로봇/물체 좌표 보기
 
-`Watch` 패널에서 `Field = qpos`로 설정하고 `Index`를 아래 값으로 바꿔 본다.
+핵심 정리(오해 방지):
 
-- floating base(로봇 pelvis 기준) 위치:
+- `qpos`와 `xpos` 모두 **world(global) 기준** 값이다.
+- 즉 `xpos`가 pelvis 기준(local)인 것은 아니다.
+- pelvis 기준 좌표가 필요하면 `inv(T_world_pelvis) @ T_world_body`처럼 직접 변환해야 한다.
+
+`Watch` 패널에서 `Field`/`Index`를 바꿔 아래 값을 확인한다.
+
+위치:
+
+- floating base(로봇 root freejoint) 위치:
   - x: `0`, y: `1`, z: `2`
 - object_joint 위치:
   - x: `36`, y: `37`, z: `38`
+
+자세(orientation):
+
+- floating base quaternion (`w,x,y,z`):
+  - `qpos[3:7]`
+- object quaternion (`w,x,y,z`):
+  - `qpos[39:43]`
+- body world quaternion을 보려면 `Field = xquat` + body id 기반 인덱스를 사용
 
 실제 확인한 body id (`xpos` 참고용):
 
@@ -490,6 +512,12 @@ python scripts/play.py replay sub8_largebox_045_original
 
 - `qpos`는 조인트 상태(루트/객체 free joint 포함) 확인에 직관적
 - `xpos`는 body world position이며 body id 기반 인덱스로 확인
+- quaternion은 항상 정규화된 회전값(`w,x,y,z`)으로 해석하고, 부호가 동시에 뒤집혀도 같은 회전을 의미할 수 있다
+
+축(axes) 시각화:
+
+- MuJoCo 왼쪽 패널 `Visualization`에서 frame 관련 토글(body/geom frame)을 켜면 축을 볼 수 있다.
+- replay에서 프레임 멈춤(`Space`) 후 `Right/Left`로 한 프레임씩 넘기면서 축과 수치를 같이 확인하면 해석이 쉽다.
 
 ### B-3. 왜 이 단계가 필요한가
 
