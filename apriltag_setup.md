@@ -537,6 +537,124 @@ EMA/Kalman을 쓰면 무조건 좋아지나?
 - 그다음 EMA를 소량 적용해 보고,
 - 필요 시 Kalman으로 확장한다.
 
+### 5-9. 노이즈 비교 실험 (cam1 vs cam2 vs fused, 500샘플)
+
+카메라 상태/그림자/가림에 따라 노이즈가 달라지는지 수치로 확인한다.
+
+실행 예시(원점=tag0, 타겟=tag1, 각 500샘플):
+
+```bash
+cd /home/roy/realsense_calib
+python compare_tag_rel_stats.py \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --extrinsic camera1_to_camera2_extrinsic.npz \
+  --tag-config config/tag_sizes.json \
+  --origin-id 0 \
+  --target-id 1 \
+  --num-samples 500 \
+  --width 960 --height 540 --fps 60
+```
+
+출력 항목:
+
+- `cam1_only (transformed to C2)`: cam1 단독 추정(좌표계만 C2로 통일)
+- `cam2_only (C2/world)`: cam2 단독 추정
+- `fused`: cam1+cam2 품질 가중 융합
+- 각 모드별 `mean xyz`, `std xyz`, `mean/std |rel|`
+
+### 5-10. Kalman 전/후 튐(spike) 비교 실험 (fused 기준)
+
+실험 목적:
+
+- 태그0(origin) 기준 태그1 좌표를 상자 이동 중 500샘플 수집
+- 현재 fused(raw)와 Kalman 적용 결과를 같은 데이터로 비교
+
+실행:
+
+```bash
+cd /home/roy/realsense_calib
+python evaluate_fusion_kalman_spikes.py \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --extrinsic camera1_to_camera2_extrinsic.npz \
+  --tag-config config/tag_sizes.json \
+  --anchor-config config/floor_anchor_transforms.json \
+  --fallback-anchor-ids 10 \
+  --origin-id 0 \
+  --target-ids 1,2,3,4,5 \
+  --num-samples 500 \
+  --width 960 --height 540 --fps 60 \
+  --kalman-process-var 0.05 \
+  --kalman-meas-var 0.01 \
+  --spike-k 6.0
+```
+
+Kalman/스파이크 하이퍼파라미터(짧은 가이드):
+
+- `--kalman-process-var`: 시스템(실제 움직임) 변화량 가정. 크게 하면 반응이 빨라지지만 노이즈를 더 통과시킬 수 있음.
+- `--kalman-meas-var`: 측정 노이즈 가정. 크게 하면 관측을 덜 믿고 더 부드럽지만 지연이 커질 수 있음.
+- `--spike-k`: 스파이크 판정 민감도 (`jump > median + k*MAD`). 작을수록 민감(스파이크 많이 검출), 클수록 보수적.
+
+바닥 백업 앵커(tag10) 고정변환 캘리브 (`T_tag0_tag10`) 후 JSON 저장:
+
+```bash
+cd /home/roy/realsense_calib
+python calibrate_floor_anchor_transform.py \
+  --serial 115222071236 \
+  --calib camera2_115222071236_calibration.npz \
+  --origin-id 0 \
+  --anchor-id 10 \
+  --tag-config config/tag_sizes.json \
+  --num-samples 200 \
+  --width 960 --height 540 --fps 60 \
+  --out-config config/floor_anchor_transforms.json
+```
+
+설명:
+
+- `config/floor_anchor_transforms.json`의 `T_origin_anchor`가 `T_tag0_tag10` 역할
+- 런타임에 tag0이 안 보이면, tag10이 보일 때 `T_cam_tag0`를 복원해 같은 원점(tag0 world) 유지
+- 즉 "원점을 바꾸는" 것이 아니라 "원점을 복원"하는 구조
+
+주요 메트릭(튀는 값 판단):
+
+- `jump = ||p_t - p_(t-1)||` [m/frame]
+- `p95 jump`: 상위 5% 점프 크기 (실무에서 튐 민감도 확인에 유용)
+- `max jump`: 최악 프레임 점프
+- `spike count/ratio`:
+  - 기준: `jump > median_jump + k * MAD` (기본 `k=6`)
+  - MAD 기반이라 outlier에 강건함
+- `std xyz`, `std |rel|`: 전체 흔들림 수준
+- 가시성/오클루전:
+  - `both_cameras_have_origin_and_any_target`
+  - `cam1_only_has_origin_and_any_target`
+  - `cam2_only_has_origin_and_any_target`
+  - `neither_has_origin_and_any_target`
+  - `both_cameras_missing_all_targets` (요청한 "1~5가 두 카메라 모두에서 전부 미검출" 지표)
+
+해석 가이드:
+
+- Kalman 적용 후 `p95 jump`, `max jump`, `spike ratio`가 줄면
+  "튀는 값 억제"에 효과가 있다고 판단한다.
+- 반대로 지연/둔화가 커지면 process/meas var 튜닝이 필요하다.
+
+실험 결과 메모 (가시성/오클루전):
+
+- `both_cameras_have_origin_and_any_target`
+- `cam1_only_has_origin_and_any_target`
+- `cam2_only_has_origin_and_any_target`
+- `neither_has_origin_and_any_target`
+- `both_cameras_missing_all_targets`
+
+해석:
+
+- 약 `27.73%` 프레임에서 최소 한 카메라가 origin/target 쌍을 놓쳤다.
+- 따라서 카메라 배치 개선만으로는 한계가 있고, 박스 표면 위에 다중 태그를 부착해
+  가시성 여유를 늘리는 설계를 병행하는 것이 유리하다.
+- 권장: 상면(윗면)에 2개 이상 태그를 분산 배치하고, 필요 시 측면 태그를 추가해
+  회전/가림 상황에서도 최소 1개 이상 안정 검출되도록 구성한다.
+
 ---
 
 ## 6) 로봇 torso / 박스 pose 추정 파이프라인
@@ -560,6 +678,45 @@ python track_robot_and_box.py
 
 `track_robot_and_box.py`는 화면 오버레이 + 콘솔 출력으로 상대좌표를 바로 보여주므로,
 스무딩 전 시각 점검에 바로 쓸 수 있다.
+
+### 6-1. Box pose 추정(정지 상태) 필터 비교 메모
+
+사용 스크립트:
+
+- `estimate_box_pose_cam2_top_tags.py`
+- 규칙:
+  - `ID 0`이 보이고 `margin >= 50`이면 `mode=primary`
+  - `ID 0`이 안 보이면 `ID 2,3,4,5` 중 `margin >= 40`만 사용
+  - fallback 태그 orientation은 `ID 0` 기준으로 매핑해서 box orientation 계산
+  - box center는 top tag 기준 `z += 0.16`m (33cm 큐브 절반 높이 근사)
+
+최근 정지 테스트(300 frames) 비교:
+
+- `box_pose_none`
+  - `std xyz [m]`: `[0.0039, 0.0059, 0.0122]`
+  - `jump p95 [m/frame]`: `0.03781`
+  - `jump max [m/frame]`: `0.06392`
+- `box_pose_kalman`
+  - `std xyz [m]`: `[0.0105, 0.0051, 0.0141]`
+  - `jump p95 [m/frame]`: `0.02297`
+  - `jump max [m/frame]`: `0.25647`
+- `box_pose_ema`
+  - `std xyz [m]`: `[0.0047, 0.0020, 0.0073]`
+  - `jump p95 [m/frame]`: `0.00552`
+  - `jump max [m/frame]`: `0.07054`
+
+해석:
+
+- 이 실험 조건에서는 EMA가 가장 안정적이었다(특히 `jump p95`와 `z std`).
+- Kalman은 평균 점프는 줄였지만 특정 프레임 outlier(`jump max`)가 크게 나타났다.
+- 운영 시작점 권장: `--filter-mode ema --ema-alpha 0.20` (상황에 따라 `0.15~0.30` 튜닝).
+
+orientation 출력 해석:
+
+- 터미널의 `euler_xyz_deg=[a,b,c]`는 **쿼터니언이 아니라 Euler 각**(deg)이다.
+- 예: `[-8.63, -0.95, -111.46]`는 `roll(x), pitch(y), yaw(z)` 각도.
+- 쿼터니언은 4개 성분(`x,y,z,w` 또는 `w,x,y,z`)이 필요하며, 현재 출력은 3개 Euler 각이다.
+- Euler는 직관적이지만 singularity(짐벌락) 영향이 있으므로, 저장/내부 연산은 quaternion 또는 rotation matrix 유지가 안전하다.
 
 ---
 
