@@ -89,6 +89,29 @@ tracking 쪽에서 실제로 하는 일:
 - `motion_anchor_*_b`류 관측을 현재 로봇 anchor 기준으로 변환
 - 최종적으로 정책엔 local/상대 정보가 들어감
 
+### 3-1. `motion_anchor_pos/ori`는 센서로 "reference를 추정"하는 항목이 아님
+
+자주 헷갈리는 포인트라 명확히 적는다.
+
+- `motion_anchor_*`의 `motion` 쪽은 센서에서 추정하는 값이 아니라, `npz` reference에서 읽은 값이다.
+- 센서(IMU/encoder, 내부 state estimator)는 "현재 로봇 상태"를 제공한다.
+- 관측에서 하는 일은 **reference와 현재 상태의 상대값 계산**이다.
+
+즉:
+- `motion_anchor_pos_b`: reference anchor pos와 현재 robot anchor pos의 상대 위치
+- `motion_anchor_ori_b`: reference anchor ori와 현재 robot anchor ori의 상대 회전
+
+실기 C++ mimic도 같은 구조:
+- reference quat: motion file(`npz`) + joint
+- current quat: robot state(root quat + torso 관련 joint)
+- 둘의 상대 회전을 `motion_anchor_ori_b`로 구성
+
+주의:
+- IMU만으로 절대 위치를 장시간 정확히 적분하는 것은 드리프트 때문에 어렵다.
+- 그래서 `No-State-Estimation` tracking 설정에서는 actor obs에서
+  `motion_anchor_pos_b`, `base_lin_vel`를 빼는 변형이 이미 제공된다.
+- 절대 위치 정합이 중요하면 AprilTag/mocap/VIO/UWB 같은 외부 기준을 보강하는 것이 안전하다.
+
 의미:
 - sim2real 성공 조건은 "절대 world 원점 일치"보다도
 - **정책이 기대한 관측 파이프라인(순서/스케일/지연/history)을 실기에서도 동일하게 재현**하는 것.
