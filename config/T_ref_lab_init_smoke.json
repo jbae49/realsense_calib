@@ -1,0 +1,70 @@
+{
+  "T_ref_lab": [
+    [
+      1.0,
+      -0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "R_ref_lab": [
+    [
+      1.0,
+      -0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "t_ref_lab": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "diagnostics": {
+    "n_used": 60,
+    "yaw_deg": 0.0,
+    "translation_xyz_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "torso_rmse_m": 0.0,
+    "yaw_inlier_count": 60,
+    "trans_inlier_count": 60,
+    "obj_rmse_m": 0.0
+  },
+  "meta": {
+    "obs_csv": "/home/roy/realsense_calib/outputs/init_obs_torso_obj.csv",
+    "ref_npz": "/home/roy/realsense_calib/humanoid_project/src/assets/OmniRetarget/processed/sub8_largebox_045_original.npz",
+    "ref_start_frame": 0,
+    "num_frames": 60,
+    "method": "yaw-only robust init (median gate + circular mean + MAD translation filter)"
+  }
+}

@@ -581,8 +581,8 @@ python evaluate_fusion_kalman_spikes.py \
   --tag-config config/tag_sizes.json \
   --anchor-config config/floor_anchor_transforms.json \
   --fallback-anchor-ids 10 \
-  --origin-id 0 \
-  --target-ids 1,2,3,4,5 \
+  --origin-id 1 \
+  --target-ids 0,2,3,4,5 \
   --num-samples 500 \
   --width 960 --height 540 --fps 60 \
   --kalman-process-var 0.05 \
@@ -684,11 +684,53 @@ python track_robot_and_box.py
 사용 스크립트:
 
 - `estimate_box_pose_cam2_top_tags.py`
+- `estimate_box_pose_two_cams_top_tags.py` (cam1+cam2 융합 + EMA + quaternion 출력)
 - 규칙:
   - `ID 0`이 보이고 `margin >= 50`이면 `mode=primary`
   - `ID 0`이 안 보이면 `ID 2,3,4,5` 중 `margin >= 40`만 사용
   - fallback 태그 orientation은 `ID 0` 기준으로 매핑해서 box orientation 계산
   - box center는 top tag 기준 `z += 0.16`m (33cm 큐브 절반 높이 근사)
+
+cam1+cam2 버전 pose/quaternion 처리:
+
+- cam1 검출은 `T_c2_c1 @ T_c1_tag`로 cam2 좌표계로 변환
+- 같은 `tag_id`의 cam1/cam2 후보를 `decision_margin` 가중으로 융합
+  - position: 가중평균
+  - rotation: 가중합 + SVD 정규직교화
+- origin은 `ID 1` 기준으로 변환하고, 필요 시 fallback anchor로 복원
+- box orientation은 `mode=primary`면 `ID 0` 직접 사용, `mode=fallback`이면 `2,3,4,5`를 `ID 0` 기준 orientation으로 매핑 후 가중평균
+- 시간축 필터는 `--filter-mode none|kalman|ema`; 최근 운영은 EMA(`alpha=0.20`)가 가장 안정적
+- 출력은 `quat_wxyz` 또는 `quat_xyzw` 선택 가능 (`--quat-order`)
+
+최근 사용 커맨드(c1+c2, EMA, quaternion 출력):
+
+```bash
+cd /home/roy/realsense_calib
+python estimate_box_pose_two_cams_top_tags.py \
+  --cam1-serial 935322072654 \
+  --cam2-serial 115222071236 \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --extrinsic camera1_to_camera2_extrinsic.npz \
+  --origin-id 1 \
+  --primary-id 0 \
+  --fallback-ids 2,3,4,5 \
+  --primary-margin-min 50 \
+  --fallback-margin-min 40 \
+  --box-half-height 0.16 \
+  --tag-config config/tag_sizes.json \
+  --fallback-anchor-ids 10 \
+  --width 960 --height 540 --fps 60 \
+  --filter-mode ema \
+  --ema-alpha 0.20 \
+  --quat-order wxyz \
+  --print-every 1
+```
+
+최근 출력 예시:
+
+- `[frame 179] ... pos=[+0.6867,-0.0281,-0.1927] quat_wxyz=[+0.56429,-0.01468,+0.01042,-0.82538] ...`
+- `[frame 180] ... pos=[+0.6865,-0.0266,-0.1918] quat_wxyz=[+0.56461,-0.00929,+0.01232,-0.82521] ...`
 
 최근 정지 테스트(300 frames) 비교:
 
@@ -710,6 +752,11 @@ python track_robot_and_box.py
 - 이 실험 조건에서는 EMA가 가장 안정적이었다(특히 `jump p95`와 `z std`).
 - Kalman은 평균 점프는 줄였지만 특정 프레임 outlier(`jump max`)가 크게 나타났다.
 - 운영 시작점 권장: `--filter-mode ema --ema-alpha 0.20` (상황에 따라 `0.15~0.30` 튜닝).
+
+시행착오 메모(간결):
+
+- origin(1)과 anchor(10)을 동시 퓨전하는 실험은 좌표계 흔들림이 커져서 일단 롤백하고, `origin direct -> missing 시 fallback` 순서로 유지.
+- box center z 보정 부호를 재확인: 본 실험 축 정의에서는 center 계산 시 `z += 0.16`이 맞다.
 
 orientation 출력 해석:
 
@@ -801,8 +848,12 @@ python scripts/play.py replay sub8_largebox_045_original
 - frame: `0/283`
 - root_pos: `[-1.1321, +0.6698, +0.7982]`
 - root_quat: `[-0.7029, -0.0523, -0.0514, +0.7075]`
+- root_euler_xyz_deg (from quat `w,x,y,z`): `[+0.05, +8.41, -90.37]`
+- torso_pos (`body_pos_w[0,16]`): `[-1.0266, +0.5530, +1.0597]`
+- torso_quat (`body_quat_w[0,16]`, `w,x,y,z`): `[-0.6433, -0.3397, -0.1597, +0.6672]`
 - obj_pos: `[-1.1993, +0.3165, +0.1834]`
 - obj_quat: `[-0.0728, +0.9474, +0.3096, +0.0354]`
+- obj_euler_xyz_deg (from quat `w,x,y,z`): `[-173.29, -6.44, +35.82]`
 
 메모:
 
@@ -834,6 +885,119 @@ python scripts/play.py replay sub8_largebox_045_original
   "head에 붙인 태그를 직접 관측"하고, torso는 그 태그에서 변환으로 얻는다.
 - replay(OmniRetarget)에서는 `body_pos_w/body_quat_w`를 통해 로봇 body 상태를 재생하며,
   운영 확인 단계에서는 보통 `root(pelvis)`, `torso_link`, `object`를 우선 점검한다.
+
+### B-5. 정수리(head) 태그만으로 torso를 얼마나 정확히 맞출 수 있나?
+
+핵심 결론:
+
+- 정수리 태그만으로도 `T_world_tag`는 얻을 수 있고, `T_tag_torso`가 잘 보정되어 있으면
+  `T_world_torso = T_world_tag @ T_tag_torso`로 torso pose를 실시간 추정할 수 있다.
+- 다만 이것을 "항상 절대 정답"으로 보기는 어렵다.  
+  태그 가림/시야각/해상도/모션블러/부착 오차에 따라 특히 orientation 오차가 커질 수 있다.
+- 따라서 운영에서는 "정수리 태그 절대값 단독 의존"보다
+  "초기 정렬 + 상대 상태 중심" 구성이 더 robust하다.
+
+왜 한계가 생기나:
+
+- 태그 부착 위치가 torso 기준점과 떨어져 있어 작은 각도 오차가 위치 오차로 증폭될 수 있다.
+- head-tag 부착각이 미세하게 틀어지면 yaw/roll/pitch 해석이 누적 오프셋으로 남을 수 있다.
+- 동작 중 일부 프레임에서 태그 품질이 급락하면 quaternion이 순간적으로 튈 수 있다.
+
+실무 권장(robust) 전략:
+
+1. 시작 시점 정렬(초기화):  
+   실험 시작 프레임에서 로봇/물체를 레퍼런스 초기 pose에 맞추고,
+   "우리 world -> 레퍼런스 world" 고정변환 `T_ref_world`를 1회 추정한다.
+2. 런타임 상태는 상대값 중심 사용:  
+   정책 입력은 가능한 한 `object w.r.t torso` 같은 상대 pose를 주로 사용한다.
+3. 절대값은 저주파 보정 용도로 사용:  
+   head-tag 기반 torso 절대 pose는 drift correction/초기화 기준으로 쓰고,
+   순간 제어는 필터링된 상대 상태를 우선한다.
+4. 품질 게이팅:  
+   tag margin/가시성 기준 미달 시 마지막 신뢰 상태 유지 + 완만한 복귀(EMA/Kalman) 적용.
+5. 정기 검증:  
+   `validate_head_to_torso.py`로 head-tag 기반 torso와 torso 보조태그 직접측정 오차(cm)를 점검한다.
+
+즉, 질문한 방식처럼:
+
+- "원점 기준으로 로봇 위치를 대략 맞춘 뒤,
+- 레퍼런스 모션을 우리 기준으로 pos/ori 변환해 사용"은 가능하고,
+- 실제로 robust 운영을 위해 권장되는 접근이다.
+
+단, 이때도 물체는 반드시 같은 변환체인에서 일관되게 처리해야 한다:
+
+- `T_ref_obj = T_ref_world @ T_world_obj`
+- `T_ref_torso = T_ref_world @ T_world_torso`
+- 정책 입력 상대값은 `T_torso_obj = inv(T_ref_torso) @ T_ref_obj`처럼 계산해
+  좌표계 불일치(축/부호/오프셋) 리스크를 줄인다.
+
+### B-6. Robust 초기 정렬 스크립트 (`T_ref_lab`) — 첫 N프레임 + yaw-only + outlier reject
+
+"작은 초기화 스크립트"가 하는 일:
+
+- 실험실에서 측정한 초기 구간 N프레임(`obs csv`)과
+- OmniRetarget reference(`npz`)를 매칭해서
+- 고정변환 `T_ref_lab`를 추정한다.
+
+알고리즘(robust):
+
+1. torso yaw 차이(`ref - obs`)를 프레임별로 계산
+2. median 게이팅으로 yaw outlier 제거
+3. 원형평균(circular mean)으로 `yaw_offset` 추정
+4. 해당 yaw를 적용한 뒤 torso 위치 차이(`ref - Rz*obs`)를 계산
+5. MAD 기반 outlier reject 후 translation 평균
+6. 최종 `T_ref_lab = [Rz(yaw), t]` 저장
+
+스크립트:
+
+- `compute_ref_alignment_yaw_only.py`
+
+입력 `obs csv` 컬럼(둘 중 하나 네이밍 세트면 자동 인식):
+
+- torso/root position:  
+  - `torso_x,torso_y,torso_z` 또는 `torso_pos_x,torso_pos_y,torso_pos_z`  
+  - `root_x,root_y,root_z` 또는 `root_pos_x,root_pos_y,root_pos_z`
+- torso/root quaternion(wxyz):  
+  - `torso_qw,torso_qx,torso_qy,torso_qz` 또는 `torso_quat_w,...`  
+  - `root_qw,root_qx,root_qy,root_qz` 또는 `root_quat_w,...`
+- object는 선택:
+  - `obj_pos_x,obj_pos_y,obj_pos_z` (또는 `object_pos_x,...`)
+
+실행 예시:
+
+```bash
+cd /home/roy/realsense_calib
+python3 compute_ref_alignment_yaw_only.py \
+  --obs-csv outputs/init_obs_torso_obj.csv \
+  --ref-npz humanoid_project/src/assets/OmniRetarget/processed/sub8_largebox_045_original.npz \
+  --ref-start-frame 0 \
+  --num-frames 60 \
+  --yaw-gate-deg 20 \
+  --out-json config/T_ref_lab_init.json
+```
+
+출력:
+
+- `config/T_ref_lab_init.json`
+  - `T_ref_lab` (4x4)
+  - `yaw_deg`, `translation_xyz_m`
+  - `torso_rmse_m` (+ object 컬럼 있으면 `obj_rmse_m`)
+  - yaw/translation inlier 개수
+
+운영/검증 기준(권장):
+
+- 초기 정렬 직후 `torso_rmse_m`가 작을 것(태스크 허용치 기준, 예: 2~5 cm)
+- object를 같이 넣었다면 `obj_rmse_m`도 동시에 확인
+- 초기화 구간 동안 inlier 비율이 충분할 것(예: 70% 이상)
+- 런타임에서는 상대량(`object w.r.t torso`)을 주 관측으로 사용하고,
+  `T_ref_lab`는 재초기화/저주파 보정 용도로 사용
+- 중간 재초기화 시점의 pose jump가 과도하면(`>허용치`) 게이팅/필터 강화
+
+주의:
+
+- 이 스크립트는 yaw-only 정렬이 기본이다(휴머노이드 초기화에서 안정적).
+- 바닥이 수평이 아니거나 roll/pitch 오프셋이 큰 환경이면
+  full SE(3) 정렬 또는 별도 leveling 절차를 추가해야 한다.
 
 ---
 
@@ -944,3 +1108,137 @@ python scripts/play.py replay sub8_largebox_045_original
 4. `T_world_torso`, `T_world_object`, `T_torso_object` 로그를 학습/배포 관측 정의와 대조  
 
 특히 "정중앙 + orientation + torso 기준" 3개가 동시에 맞아야, 나중에 정책이 붙었을 때 틀어짐을 줄일 수 있다.
+
+---
+
+## 13) Sim2Real Deployment 정리 (tracking policy, local-frame obs 기준)
+
+이 섹션은 "태깅 이후 실제 배포"를 위한 운영 기준이다.
+
+핵심 결론:
+
+- `whole_body_tracking`은 학습 중심 레포이며, 실기 상태추정기 구현이 핵심이 아니다.
+- 실기 배포는 `motion_tracking_controller` + `legged_control2::StateEstimator` 흐름이 직접적이다.
+- 정책 입력 `motion_anchor_pos_b`, `motion_anchor_ori_b`는 global이 아니라 robot anchor 기준 local 값이다.
+- 외부 AprilTag는 "필수"가 아니라 "보조 절대기준"이다.
+
+### 13-1. AprilTag를 로봇에 꼭 붙여야 하나?
+
+정답:
+
+- "박스(local 기준) 추종"만 필요하고 내부 상태추정 품질이 충분하면, 로봇 태그 없이도 가능하다.
+- 다만 아래 상황에서는 로봇 태그를 권장한다:
+  - 초기 world 정렬 자동화가 필요할 때
+  - 장시간 drift를 외부에서 보정해야 할 때
+  - 실험 반복 간 재현성을 높여야 할 때
+
+즉, 로봇 정수리 태그는 "state estimator 대체"가 아니라
+"초기 정렬/외부 보정/검증용 기준 센서"로 보는 것이 맞다.
+
+### 13-2. 배포 시 obs 측정 원칙 (학습/실기 일치)
+
+원칙:
+
+- obs 의미/좌표계/단위/스케일/순서가 학습과 실기에서 완전히 같아야 한다.
+- 특히 local 항목(`*_b`)은 동일한 frame 변환 체인을 사용해야 한다.
+
+대표 obs 항목(학습 기준):
+
+- `command`
+- `motion_anchor_pos_b`
+- `motion_anchor_ori_b`
+- `base_lin_vel`
+- `base_ang_vel`
+- `joint_pos_rel`
+- `joint_vel_rel`
+- `last_action`
+
+실기에서는:
+
+- IMU + encoder + contact (+선택적 외부보정)로 상태추정
+- 추정된 로봇 상태에서 동일 수식으로 local obs 계산
+
+### 13-3. local frame 상대변환 수식 (실수 방지용)
+
+`A=robot anchor`, `B=motion/object anchor`, 둘 다 같은 world 기준일 때:
+
+- `p_a_b = R_w_a^T * (p_w_b - p_w_a)`
+- `R_a_b = R_w_a^T * R_w_b`
+- quaternion: `q_a_b = inv(q_w_a) ⊗ q_w_b`
+
+`subtract_frame_transforms(A, B)`는 위 연산을 수행하는 형태다.
+
+주의:
+
+- ref/world가 다르면 먼저 `T_lab_ref`로 world를 통일한 뒤 계산한다.
+
+### 13-4. 실기 배포 파이프라인(권장)
+
+1. Policy I/O 고정
+
+- ONNX 입력 키, 차원, 순서를 문서로 고정
+
+2. Obs 스펙 동결
+
+- term별 좌표계(global/local), 단위(m/rad), 정규화/클리핑 기준 확정
+
+3. Sim runtime 검증
+
+- obs NaN/범위/차원 체크
+
+4. Real runtime 동일 구현
+
+- `state_estimator` 기반으로 같은 obs term 계산
+
+5. 오프라인 리플레이 비교
+
+- 같은 로그를 sim 구현 vs real 구현에 넣어 term별 통계 비교
+
+6. 안전 단계 실행
+
+- Standby/Hold -> FixStand -> Policy 단계로 상승
+
+7. 튜닝
+
+- scale, damping, action clip, safety threshold 조정
+
+### 13-5. "첫 프레임 정렬만 하면 충분한가?"에 대한 운영 답변
+
+결론:
+
+- 조건부로 가능하지만, robust를 위해 재초기화/게이팅이 필요하다.
+
+권장 운영:
+
+- 초기 `T_ref_lab`는 `compute_ref_alignment_yaw_only.py`로 추정
+- 런타임에서는 상대량(`object w.r.t torso`)을 주 관측으로 사용
+- 절대량은 저주파 보정/재초기화 용도로 제한
+- 품질 저하(margin/dropout) 구간은 hold/EMA/Kalman으로 완화
+
+### 13-6. 실기 전 체크리스트 (강추)
+
+A. Dry-run
+
+- 정책 추론/obs 계산은 수행하되 실제 모터 publish 차단(`--dry-run` 권장)
+- 추론 Hz, 지터, 입력 차원 mismatch 먼저 제거
+
+B. Obs 품질 검증
+
+- term별 mean/std/min/max, saturate 비율, NaN 검사
+- sim vs real 분포 비교(`base_ang_vel`, `joint_pos_rel`, `motion_anchor_*`)
+
+C. 주기/지연 검증
+
+- 정책 루프(예: 50Hz), 저수준 송신 루프(예: 500~1000Hz) 실측
+- worst-case latency/jitter 측정
+
+D. 안전 fallback
+
+- 추론 실패/입력 이상 시 즉시 hold/passive 전환
+- timeout 전환은 e-stop 대체가 아니라 "소프트 안전장치"로 간주
+
+### 13-7. AprilTag 사용 여부 의사결정 요약
+
+- 불필요(가능): local-relative 추종 중심 + 내부 추정기 충분히 안정적
+- 권장(보조): world 정합, drift 억제, 반복재현성, 디버깅이 중요할 때
+- 필수에 가까움: 외부 물체와 절대 위치 오차를 엄격히 제한해야 할 때
