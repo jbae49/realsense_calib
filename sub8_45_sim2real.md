@@ -366,3 +366,86 @@ ls -la /home/roy/realsense_calib/humanoid_project/deploy/robots/g1/config/policy
 1. `sub8_45` 전용 FSM 상태를 dance와 분리(버튼 충돌 제거)
 2. mimic 진입 직전 자동 pre-check(자세/IMU/통신 상태 OK일 때만 진입)
 
+---
+
+## 16) 참고: `unitree_rl_mjlab` task/obs 맵 (요약)
+
+아래는 `unitree_rl_mjlab`에서 G1 기준으로 실무에서 자주 보는 task들과 obs 구성을 정리한 참고자료다.
+
+### 16-1. G1 관련 대표 task
+
+- `Unitree-G1-Rough` (velocity locomotion)
+  - 등록 위치: `unitree_rl_mjlab/src/tasks/velocity/config/g1/__init__.py`
+- `Unitree-G1-Flat` (velocity locomotion)
+  - 등록 위치: `unitree_rl_mjlab/src/tasks/velocity/config/g1/__init__.py`
+- `Unitree-G1-Tracking` (motion tracking)
+  - 등록 위치: `unitree_rl_mjlab/src/tasks/tracking/config/g1/__init__.py`
+- `Unitree-G1-Tracking-No-State-Estimation` (tracking 변형)
+  - 등록 위치: `unitree_rl_mjlab/src/tasks/tracking/config/g1/__init__.py`
+
+실기 deploy(FSM)에서는 학습 task_id 대신 state 이름으로 동작한다.
+- `Velocity` state (로코모션 정책)
+- `Mimic_*` state (npz reference 추종 정책)
+- 설정 위치: `unitree_rl_mjlab/deploy/robots/g1/config/config.yaml`
+
+### 16-2. task별 actor obs 핵심
+
+- `Velocity` (`Unitree-G1-Rough`/`Flat`)
+  - 기본: `base_ang_vel`, `projected_gravity`, `command(twist)`, `phase`,
+    `joint_pos`, `joint_vel`, `actions`
+  - rough에서는 `height_scan` 포함, flat에서는 제거
+  - 정의 위치: `unitree_rl_mjlab/src/tasks/velocity/velocity_env_cfg.py`,
+    `unitree_rl_mjlab/src/tasks/velocity/config/g1/env_cfgs.py`
+
+- `Tracking` (`Unitree-G1-Tracking`)
+  - `command(motion)`, `motion_anchor_pos_b`, `motion_anchor_ori_b`,
+    `base_lin_vel`, `base_ang_vel`, `joint_pos`, `joint_vel`, `actions`
+  - 정의 위치: `unitree_rl_mjlab/src/tasks/tracking/tracking_env_cfg.py`
+
+- `Tracking-No-State-Estimation`
+  - 위 Tracking에서 actor obs 일부 제거:
+    `motion_anchor_pos_b`, `base_lin_vel` 제외
+  - 위치: `unitree_rl_mjlab/src/tasks/tracking/config/g1/env_cfgs.py`
+
+- 실기 `Mimic` deploy (`State_Mimic`)
+  - deploy 예시 obs: `motion_command`, `motion_anchor_ori_b`,
+    `base_ang_vel`, `joint_pos_rel`, `joint_vel_rel`, `last_action`
+  - 예시 파일: `unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/dance1_subject2/params/deploy.yaml`
+
+### 16-3. "각 obs를 어떻게 추정하나?" (센서/연산 소스)
+
+- `joint_pos`, `joint_vel`
+  - 모터 엔코더/저수준 state에서 온다.
+- `base_ang_vel`, `base_lin_vel`, `projected_gravity`
+  - IMU + 내부 state estimator 기반.
+- `command(twist)`
+  - 속도 명령 생성기(joystick/command term)에서 생성.
+- `motion_command`
+  - `npz`의 `joint_pos/joint_vel`를 현재 시각(time index) 기준으로 읽음.
+- `motion_anchor_pos_b`, `motion_anchor_ori_b`
+  - "센서로 reference를 추정"하는 값이 아님.
+  - reference anchor는 `npz`에서 읽고, robot anchor는 현재 state에서 읽은 뒤,
+    두 프레임의 상대변환으로 계산한다.
+  - 구현 위치:
+    - `unitree_rl_mjlab/src/tasks/tracking/mdp/commands.py`
+    - `unitree_rl_mjlab/src/tasks/tracking/mdp/observations.py`
+- `last_action`
+  - 직전 policy action을 재사용한 내부 상태 항목.
+
+### 16-4. 실기 `Mimic`에서 orientation이 만들어지는 방식
+
+- reference 쪽:
+  - `State_Mimic::MotionLoader_`가 `npz`에서 root/joint를 읽음.
+- real 쪽:
+  - 로봇 root quaternion + 특정 torso 관절각(motor state)으로 현재 torso quat 구성.
+- 관측:
+  - 두 쿼터니언 상대회전의 회전행렬 일부(6D representation)를
+    `motion_anchor_ori_b`로 넣음.
+- 구현 파일:
+  - `unitree_rl_mjlab/deploy/robots/g1/src/State_Mimic.cpp`
+  - `unitree_rl_mjlab/deploy/robots/g1/include/State_Mimic.h`
+
+요약하면, `unitree_rl_mjlab`은 "proprio only" 한 종류가 아니라
+task마다 obs가 다르고, tracking/mimic 계열은 `npz reference + 현재 state`
+를 결합한 상대표현 obs를 사용한다.
+
