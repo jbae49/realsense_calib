@@ -571,6 +571,149 @@ cd ~/unitree_rl_mjlab/deploy/robots/g1/build
 
 ---
 
+## 7-C) Cable-free 운영 (wifi로만 SSH, 랜선 분리)
+
+매번 노트북-Jetson을 랜선으로 연결하지 않고, **공유기 wifi**로만 SSH해서 운영하는 셋업이다.
+로봇 ↔ Jetson은 어차피 로봇 안의 케이블(eth0)로 통신하니까 노트북-Jetson 랜선만 빼는 거.
+
+### 7-C-0. 핵심 그림
+
+```
+[노트북 wlo1: 192.168.0.3]
+        │ wifi (SSH만)
+        │
+   [iptime 공유기 192.168.0.1]
+        │ wifi
+        │
+[Jetson wlan0: 192.168.0.2]   <-- SSH가 가는 곳
+        │ (같은 머신 내부)
+[Jetson eth0:  192.168.123.164]
+        │ wired (DDS 통신)
+        ▼
+[로봇 192.168.123.161]
+```
+
+요점:
+- **wifi는 사람이 Jetson을 보기 위한 통로**일 뿐, 로봇과 DDS는 wifi 안 거침
+- 로봇과의 실시간 통신은 Jetson `eth0` <-> 로봇 wired 로만 일어남 (저지연/안정)
+- 따라서 노트북-Jetson 랜선이 빠져도 로봇 제어는 영향 없음
+
+### 7-C-1. 1회성 wifi 셋업
+
+**(a) Jetson을 실험실 wifi에 붙이기** (랜선 SSH로 들어와서):
+
+```bash
+# 가능한 wifi 스캔
+sudo nmcli dev wifi list
+
+# 연결 (SSID/비밀번호는 본인 거)
+sudo nmcli dev wifi connect "iptime" password "<WIFI_PASSWORD>"
+
+# 자동연결 보장
+nmcli con mod "iptime" connection.autoconnect yes
+
+# Jetson의 wifi IP 확인 (메모!)
+ip -4 addr show wlan0
+```
+
+> Jetson은 보통 2.4GHz `iptime`만 잡힘 (Wi-Fi 어댑터에 따라). 노트북은 5GHz `iptime5G`라도 같은 공유기면 OK.
+
+**(b) 노트북도 같은 공유기 wifi에 붙이기**:
+
+같은 iptime 공유기면 SSID는 `iptime`/`iptime5G` 어느 쪽이든 통합 LAN이라 무관.
+
+**(c) "정말 같은 wifi인지" 검증** (3가지):
+
+노트북 + Jetson 각각:
+```bash
+ip route | grep default
+```
+둘 다 `default via 192.168.0.1` 같은 식으로 같은 게이트웨이가 보이면 같은 공유기 = 같은 LAN.
+
+노트북에서:
+```bash
+ping -c 3 192.168.0.2     # Jetson wlan0
+```
+응답 오면 통신 OK 확정.
+
+> ping이 실패하면 공유기의 "무선 격리(AP isolation)" 설정 확인.
+> 192.168.0.1 관리자 페이지에서 OFF.
+
+### 7-C-2. SSH 별칭 정리
+
+`~/.bashrc`에 wired/wifi 둘 다 등록:
+
+```bash
+# 노트북에서 한 번만
+sed -i "s|^alias g1=.*|alias g1='ssh unitree@192.168.123.164'|" ~/.bashrc
+echo "alias g1w='ssh unitree@192.168.0.2'" >> ~/.bashrc
+source ~/.bashrc
+```
+
+사용:
+- `g1` -> wired SSH (랜선 꽂혔을 때)
+- `g1w` -> wifi SSH (랜선 빠졌을 때)
+
+> Jetson wifi IP가 DHCP라 재부팅 후 바뀔 수 있다. 자주 바뀌면 iptime 관리자(192.168.0.1)에서 MAC 기반 고정 IP 등록 권장.
+> Jetson MAC 확인: `ip link show wlan0 | awk '/ether/ {print $2}'`
+
+### 7-C-3. tmux 안에서 g1_ctrl 띄우기 (필수)
+
+SSH 세션이 끊겨도 g1_ctrl이 살아있게 하려면 반드시 `tmux` 사용.
+
+```bash
+g1w                                   # 또는 g1 (wired)
+
+# Jetson 안에서
+tmux new -s g1                        # 세션 생성
+cd ~/unitree_rl_mjlab/deploy/robots/g1/build
+./g1_ctrl --network=eth0
+# 정상 시작 로그 확인 (FSM: Start Passive)
+
+# detach: Ctrl+B 누르고 D
+```
+
+이제 랜선 빼거나 wifi 잠깐 끊겨도 g1_ctrl은 Jetson 안에서 살아있다.
+
+### 7-C-4. 다시 붙기 / 종료
+
+```bash
+# 다시 붙기 (모니터링 재개)
+g1w                                   # 또는 g1
+tmux attach -t g1
+
+# 종료
+# tmux attach 한 상태에서:
+#   Ctrl+C  ->  g1_ctrl 종료
+#   exit    ->  tmux 세션 종료
+```
+
+> Ctrl+C는 **컨트롤러로 SELECT(Passive 복귀)** 한 다음에 누르는 게 안전.
+
+### 7-C-5. "랜선 빼면 SSH는 죽지만 g1_ctrl은 살아있다"의 이유
+
+| 무엇 | 어디 경로 | 랜선 빼면? |
+| --- | --- | --- |
+| 노트북 SSH (wired용 `g1`) | 노트북 eno1 - 랜선 - Jetson eth0 | **끊김** (TCP keepalive timeout 후 세션 종료) |
+| 노트북 SSH (wifi용 `g1w`) | 노트북 wlo1 - 공유기 wifi - Jetson wlan0 | 영향 없음 |
+| Jetson 안의 g1_ctrl 프로세스 | Jetson 내부 | 영향 없음 (단, SSH 세션이 부모면 SIGHUP으로 같이 죽음 -> tmux로 분리 필요) |
+| 로봇 ↔ Jetson DDS | 로봇 - 로봇 안 케이블 - Jetson eth0 | 영향 없음 (이건 노트북 랜선과 무관) |
+
+그래서 **`g1w` + `tmux`** 조합이 cable-free 운영의 정답.
+
+### 7-C-6. 자주 막히는 포인트 (cable-free)
+
+| 증상 | 원인 / 해결 |
+| --- | --- |
+| `g1` 별칭만 안 됨, ping은 잘 됨 | 별칭이 옛 IP를 가리킴. 7-C-2 수정 |
+| `ssh: No route to host` (wifi 시도) | 노트북 wifi 꺼짐(wlo1 DOWN), 또는 Jetson wifi 끊김 |
+| `ping 192.168.0.2` 실패 | (1) Jetson wifi 안 붙음 (2) 공유기 AP isolation (3) 다른 공유기 wifi |
+| 랜선 빼니까 g1_ctrl도 죽음 | tmux 안 썼음. 7-C-3 다시 |
+| Jetson 재부팅 후 wifi IP 바뀜 | DHCP lease 만료. iptime 관리자에서 MAC 기반 고정 IP 등록 |
+| Jetson에 wifi 어댑터는 보이는데 SSID 스캔 안 됨 | `sudo systemctl restart NetworkManager` 한 번 |
+
+---
+
 ## 8) FSM 조작 순서 (실기)
 
 현재 기본 매핑 기준:
