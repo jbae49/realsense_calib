@@ -3,14 +3,75 @@
 이 문서는 `sub8_largebox_045` 모션 추종을 실제 G1에 올릴 때, 처음부터 끝까지 따라갈 수 있게 정리한 실행 가이드다.
 
 기준 코드/경로:
-- 프로젝트 루트: `/home/roy/realsense_calib/humanoid_project`
-- 실기 deploy: `/home/roy/realsense_calib/humanoid_project/deploy/robots/g1`
-- FSM 설정: `/home/roy/realsense_calib/humanoid_project/deploy/robots/g1/config/config.yaml`
+- 프로젝트 루트: `/home/roy/realsense_calib/unitree_rl_mjlab`
+- 실기 deploy: `/home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1`
+- FSM 설정: `/home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/config/config.yaml`
 - 현재 버튼 매핑(기본):
-  - `LT + up`: `Passive -> FixStand`
-  - `RT + A`: `FixStand -> Velocity`
-  - `RB + A`: `Velocity -> Mimic_Dance1_subject2`
-  - `LT + B`: `Velocity/Mimic -> Passive`
+  - `LT + up` (`L2 + up`): `Passive -> FixStand`
+  - `RT + A` (`R2 + A`): `FixStand -> Velocity`
+  - `RB + B` (`R1 + B`): `Velocity -> Mimic_Sub8_45`
+  - `SELECT`: `FixStand/Velocity/Mimic -> Passive` (빠른 소프트 정지 복귀)
+
+---
+
+## 0) 실행 순서 Quick Start (가장 먼저)
+
+질문이 많았던 부분을 먼저 정리한다.
+
+### 0-1. 실기(sim2real)에서 무엇을 어디서 실행하나?
+
+- 로봇 쪽:
+  1) 전원 ON
+  2) zero-torque 진입 확인
+  3) 컨트롤러에서 `L2 + R2`로 debug mode 진입
+- 노트북 쪽:
+  1) 랜선 연결
+  2) `ip -br a`로 NIC 확인
+  3) 로봇 IP ping 확인
+  4) `g1_ctrl --network=<NIC>` 실행
+
+중요:
+- Jetson 안에서 별도 스크립트를 실행해야만 하는 구조는 아니다.
+- 현재 구성에서는 노트북에서 `g1_ctrl` 실행 시 `--network=eno1`처럼 NIC만 맞춰주면 된다.
+
+### 0-2. `g1_ctrl` 실행 직후 로봇 상태 (코드 기준)
+
+- `g1_ctrl`는 FSM을 `Passive` 상태로 시작한다.
+- `Passive` 상태는 `kp=0`, `kd`만 적용되고, 관절 목표각 `q`는 현재값 유지다.
+- 체감상 "댐핑 모드"처럼 보이는 게 정상이다.
+
+따라서 실행 직후 바로 적극 제어가 되는 게 아니라, 버튼 전환으로 상태를 올려야 한다.
+
+### 0-3. 버튼 순서 (현재 config 기준)
+
+1. `LT + up` (`L2 + up`) -> `FixStand`
+2. `RT + A` (`R2 + A`) -> `Velocity`
+3. `RB + B` (`R1 + B`) -> `Mimic_Sub8_45` (sub8 extended onnx)
+4. 언제든 `SELECT` -> `Passive` (안전 복귀)
+
+실무 권장:
+- **정상 진입 순서**: `Passive -> FixStand -> Velocity -> Mimic_Sub8_45`
+- mimic을 바로 켜기보다, `Velocity`에서 자세/균형/입력 상태를 2~3초 확인 후 mimic으로 전환
+
+### 0-4. 네트워크 확인 커맨드 (실기)
+
+```bash
+ip -br a
+ping -c 3 192.168.123.161
+```
+
+예시 실행:
+
+```bash
+cd /home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/build
+./g1_ctrl --network=eno1
+```
+
+### 0-5. "터미널에 전환 안내가 자동으로 뜨나?"에 대한 답
+
+- `g1_ctrl`가 FSM의 모든 버튼 순서를 친절히 안내해주지는 않는다.
+- 따라서 실제 전환 조합은 `config.yaml`을 기준으로 이해하고 운용해야 한다.
+- 즉, 실행 로그를 기다리기보다 위 `0-3` 순서대로 직접 전환한다고 생각하면 된다.
 
 ---
 
@@ -224,9 +285,289 @@ ip -br a
 robot 연결 NIC 이름(예: `enp5s0`) 확인 후 실행:
 
 ```bash
-cd /home/roy/realsense_calib/humanoid_project/deploy/robots/g1/build
+cd /home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/build
 ./g1_ctrl --network=<YOUR_ROBOT_NIC>
 ```
+
+---
+
+## 7-A) Jetson 빌드 트러블슈팅 (실제 겪은 이슈 정리)
+
+PC에서 빌드한 `g1_ctrl`은 **x86_64**라 Jetson(**aarch64**)에서 실행이 불가하다.
+따라서 코드를 Jetson으로 옮긴 뒤 Jetson에서 다시 빌드해야 하는데, 이 과정에서 마주친 이슈들과 해결법을 순서대로 정리한다.
+
+### 7-A-0. 사전: Jetson 접속
+
+- 로봇망에서 Jetson은 `192.168.123.164` (사용자 환경 기준).
+- 노트북 NIC를 같은 서브넷에 두고 `ssh unitree@192.168.123.164`로 접속.
+
+### 7-A-1. ONNX Runtime 라이브러리 경로
+
+증상:
+```
+g1_ctrl: error while loading shared libraries: libonnxruntime.so.1: cannot open shared object file
+```
+
+원인:
+- `g1_ctrl` 바이너리의 RUNPATH가 빌드 당시 절대경로로 박혀 있어, Jetson에선 그 경로가 비어 있음.
+
+해결 (Jetson에서):
+```bash
+echo 'export LD_LIBRARY_PATH=$HOME/unitree_rl_mjlab/deploy/thirdparty/onnxruntime-linux-aarch64-1.22.0/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+확인:
+```bash
+ldd ~/unitree_rl_mjlab/deploy/robots/g1/build/g1_ctrl | grep onnx
+```
+
+> 매번 직접 export 하는 건 피곤하니까 `~/.bashrc`에 박아두는 게 권장.
+
+### 7-A-2. unitree_sdk2 헤더가 구버전 (`dds_wrapper` 누락)
+
+증상 (cmake 단계 또는 빌드 초반):
+```
+fatal error: unitree/dds_wrapper/robots/go2/go2.h: No such file or directory
+fatal error: unitree/dds_wrapper/robots/g1/g1_pub.h: No such file or directory
+```
+
+원인:
+- Jetson에 미리 설치돼 있던 `unitree_sdk2`가 오래된 버전이라 `dds_wrapper` 디렉토리 자체가 없음.
+- 우리 코드는 신버전 헤더(`g1_pub.h`, `g1_sub.h` 등)를 include 함.
+
+해결 (PC -> Jetson으로 신버전 헤더 복사):
+```bash
+# PC에서
+rsync -av /home/roy/unitree_sdk2/include/unitree/ \
+  unitree@192.168.123.164:/tmp/unitree_headers/
+
+# Jetson에서
+sudo rm -rf /usr/local/include/unitree
+sudo mv /tmp/unitree_headers /usr/local/include/unitree
+```
+
+### 7-A-3. `libfmt` 없음 / 버전 충돌
+
+증상:
+```
+/usr/bin/ld: cannot find -lfmt
+```
+
+원인 흐름:
+- `unitree_sdk2` 신버전이 `spdlog` -> `libfmt`를 끌어쓴다.
+- Jetson은 인터넷이 막혀 `apt install libfmt-dev` 불가.
+- PC에서 `libfmt9_*.deb`/`libfmt-dev_*.deb`를 받아 `dpkg -i` 시도 -> Jetson(Ubuntu 20.04)의
+  `libc6`/`libstdc++6`보다 최신을 요구해서 의존성 충돌.
+
+해결 (소스 빌드, 가장 안정):
+```bash
+# PC에서: fmt 6.1.2 소스를 Jetson으로 전송
+# (구 우분투/구 libstdc++와 ABI가 잘 맞는 안정 버전이 6.x대)
+
+scp fmt-6.1.2.zip unitree@192.168.123.164:/tmp/
+
+# Jetson에서
+cd /tmp && unzip fmt-6.1.2.zip && cd fmt-6.1.2
+mkdir build && cd build
+cmake .. -DBUILD_SHARED_LIBS=ON -DFMT_TEST=OFF
+make -j"$(nproc)"
+sudo make install
+sudo ldconfig
+
+# 확인: libfmt.so.6 / libfmt.so 가 /usr/local/lib에 보이면 OK
+ldconfig -p | grep -i libfmt
+```
+
+> **포인트**: Ubuntu 20.04 Jetson에서는 최신 `libfmt9/10`을 deb로 깔지 말고
+> **소스에서 6.1.2 빌드**가 가장 트러블이 적다.
+
+### 7-A-4. `libunitree_sdk2.a` 가 헤더와 안 맞아서 링크 단계 실패
+
+증상 (링크 단계, `[100%] Linking CXX executable g1_ctrl` 직후):
+```
+undefined reference to `std::vector<...entity_properties...>&
+  org::eclipse::cyclonedds::core::cdr::get_type_props<unitree_go::msg::dds_::MotorStates_>()'
+undefined reference to ...get_type_props<unitree_hg::msg::dds_::LowCmd_>()
+undefined reference to ...get_type_props<unitree_hg::msg::dds_::LowState_>()
+undefined reference to ...get_type_props<unitree_hg::msg::dds_::HandState_>()
+```
+
+원인:
+- 7-A-2에서 **신버전 헤더**만 교체하고 정작 `libunitree_sdk2.a`는 **구버전**이 그대로 있던 상태.
+- 신버전 헤더는 새 IDL 메시지(`MotorStates_`, `HandState_`, `LowState_` 등)를 선언하는데,
+  구버전 .a에는 그 IDL의 CDR serialization 심볼이 없음 -> `undefined reference` 폭주.
+
+해결 (신버전 .a로 교체, aarch64 prebuilt 그대로 사용):
+```bash
+# PC에서
+scp /home/roy/unitree_sdk2/lib/aarch64/libunitree_sdk2.a \
+  unitree@192.168.123.164:/tmp/
+
+# Jetson에서
+sudo mv /usr/local/lib/libunitree_sdk2.a /usr/local/lib/libunitree_sdk2.a.OLD
+sudo cp /tmp/libunitree_sdk2.a /usr/local/lib/libunitree_sdk2.a
+sudo ldconfig
+```
+
+이후 빌드 디렉토리를 깨끗이 비우고 다시 빌드:
+```bash
+cd ~/unitree_rl_mjlab/deploy/robots/g1/build
+rm -rf *
+cmake ..
+make -j"$(nproc)"
+```
+
+> **교훈**: SDK 업그레이드는 항상 **헤더 + .a 세트**로 같이 한다.
+> 한쪽만 갈면 컴파일은 되도 링크에서 무더기 `undefined reference`가 뜬다.
+
+### 7-A-5. `Clock skew detected. Your build may be incomplete.` 경고
+
+증상:
+```
+make[2]: warning:  Clock skew detected.  Your build may be incomplete.
+```
+
+원인:
+- `scp`로 PC에서 가져온 소스 파일의 mtime이 Jetson 시스템 시각보다 미래.
+- Jetson 시계가 NTP 동기화 안 돼서 PC보다 며칠~몇년 늦으면 발생.
+
+영향:
+- **빌드 결과물엔 영향 없음**. 무시 가능.
+
+깔끔하게 없애려면:
+```bash
+# Jetson에서 모든 소스 mtime을 현재 시각으로 통일
+find ~/unitree_rl_mjlab -exec touch {} +
+```
+
+또는 NTP 동기화:
+```bash
+sudo timedatectl set-ntp true
+```
+
+### 7-A-6. Jetson 1회성 환경설정 요약 (해야 했던 것 모음)
+
+```bash
+# 1) ONNX Runtime 경로 (~/.bashrc)
+export LD_LIBRARY_PATH=$HOME/unitree_rl_mjlab/deploy/thirdparty/onnxruntime-linux-aarch64-1.22.0/lib:$LD_LIBRARY_PATH
+
+# 2) /usr/local/include/unitree  (PC의 ~/unitree_sdk2/include/unitree 와 동일하게)
+# 3) /usr/local/lib/libunitree_sdk2.a  (PC의 ~/unitree_sdk2/lib/aarch64/libunitree_sdk2.a 와 동일하게)
+# 4) /usr/local/lib/libfmt.so* (소스 빌드된 fmt 6.1.2)
+sudo ldconfig
+```
+
+이후엔 빌드/실행이 PC에서와 동일한 절차로 돌아간다.
+
+---
+
+## 7-B) Jetson에서 g1_ctrl 켜는 순서 (매번 따라가는 runbook)
+
+빌드/환경설정 다 끝난 다음, **실제로 켤 때마다 따라가는 순서**다.
+처음 한 번만 하면 되는 셋업은 7-A, 매 세션마다 하는 절차는 여기.
+
+### 7-B-0. 사전 체크 (매번 빠르게)
+
+PC(노트북)에서:
+```bash
+# Jetson과 같은 로봇망(192.168.123.x)에 노트북도 들어와 있는지 확인
+ip -br a
+ping -c 2 192.168.123.164      # Jetson
+ping -c 2 192.168.123.161      # 로봇 본체
+```
+
+### 7-B-1. 로봇 준비 (실물)
+
+1. 로봇 전원 ON, 거치대/지면에서 안정 자세 확인
+2. zero-torque 모드 진입(자동) 확인
+3. 컨트롤러에서 **`L2 + R2`** 길게 -> 초록 LED -> debug mode 진입
+   - 이거 안 하면 controller 입력이 `g1_ctrl`까지 안 들어옴
+
+### 7-B-2. Jetson 접속
+
+PC에서:
+```bash
+ssh unitree@192.168.123.164
+```
+
+### 7-B-3. (한 번만) 환경변수 확인
+
+`~/.bashrc`에 7-A-1의 `LD_LIBRARY_PATH`가 들어있는지 한 번만 확인:
+```bash
+grep onnxruntime ~/.bashrc
+```
+
+비어있으면 7-A-1대로 추가하고 `source ~/.bashrc`.
+
+### 7-B-4. NIC 확인
+
+```bash
+ip -br a
+```
+
+기대 출력 예:
+```
+eth0   UP   192.168.123.164/24    <- 로봇망 (이걸 써야 함)
+wlan0  UP   192.168.0.x/24        <- 일반 와이파이 (DDS 안 됨)
+```
+
+> **NIC는 `eth0`** (현재 Jetson 환경 기준).
+> 노트북에서 돌릴 때만 `enp5s0`/`eno1`이지, Jetson은 `eth0`이다.
+
+### 7-B-5. 빌드 산출물/policy 파일 확인
+
+```bash
+ls -la ~/unitree_rl_mjlab/deploy/robots/g1/build/g1_ctrl
+ls -la ~/unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45/exported/policy.onnx
+ls -la ~/unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45/params/deploy.yaml
+ls -la ~/unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45/params/*.npz
+```
+
+4개 다 있어야 함. 하나라도 없으면 PC에서 `scp`로 다시 보낸다.
+
+### 7-B-6. 실행
+
+```bash
+cd ~/unitree_rl_mjlab/deploy/robots/g1/build
+./g1_ctrl --network=eth0
+```
+
+기대 시작 로그:
+- `Passive` state로 진입
+- DDS subscription "connected" 류 메시지
+- 에러 없이 메인 loop 진입
+
+### 7-B-7. FSM 진입 (컨트롤러)
+
+7-B-1에서 debug mode 들어간 컨트롤러로:
+
+1. `L2 + ↑(up)` -> **FixStand**
+   - 다리가 펴지며 정자세 진입
+2. `R2 + A` -> **Velocity**
+   - 로코모션 정책 활성, 좌스틱으로 저속 이동 가능
+3. `R1 + B` -> **Mimic_Sub8_45**
+   - sub8 mimic 정책 시작
+4. 언제든 `SELECT` -> **Passive** (안전 복귀)
+   - 비상 상황엔 무조건 이거 + 필요 시 e-stop
+
+> **권장**: `FixStand` 또는 `Velocity`에서 2~3초 안정성 확인 후 `Mimic_Sub8_45`로 전환.
+
+### 7-B-8. 자주 막히는 포인트 빠른 진단
+
+| 증상 | 원인 후보 |
+| --- | --- |
+| `g1_ctrl` 켜자마자 종료, `libonnxruntime.so.1` 에러 | 7-A-1 미적용 (`LD_LIBRARY_PATH`) |
+| 컨트롤러 눌러도 state 전환 안 됨 | 1) `L2+R2` 안 함 2) NIC 잘못 (`--network=wlan0`) 3) 로봇과 케이블 미연결 |
+| 콘솔에 `Unknown key name: SELECT` | `config.yaml`에 `SELECT.on_pressed`가 남아있음. `back.on_pressed`로 바꿔야 함 (DSL 키 이름 다름) |
+| `Input name time_step not found in observations.` | `manager_based_rl_env.h`의 `time_step` 인젝션 패치 누락 -> rebuild 필요 |
+| 빌드는 OK인데 실행 시 ONNX 차원 mismatch | onnx와 deploy.yaml 세트가 다른 학습 산출물 |
+
+### 7-B-9. 종료
+
+1. 컨트롤러 `SELECT` -> Passive
+2. 터미널 `Ctrl+C` -> `g1_ctrl` 종료
+3. 로봇은 자동으로 zero-torque로 돌아감
 
 ---
 
@@ -235,14 +576,14 @@ cd /home/roy/realsense_calib/humanoid_project/deploy/robots/g1/build
 현재 기본 매핑 기준:
 
 1. 초기: `Passive`
-2. `LT + up` -> `FixStand`
-3. `RT + A` -> `Velocity` (기본 로코모션)
-4. `RB + A` -> `Mimic_*` (설정한 mimic state)
-5. 언제든 `LT + B` -> `Passive` (소프트 정지)
+2. `LT + up` (`L2 + up`) -> `FixStand`
+3. `RT + A` (`R2 + A`) -> `Velocity` (기본 로코모션)
+4. `RB + B` (`R1 + B`) -> `Mimic_Sub8_45`
+5. 언제든 `SELECT` -> `Passive` (소프트 정지)
 
 운영 권장:
 - 무조건 `FixStand`에서 2~3초 안정 확인 후 mimic 진입
-- 실험자 1명은 게임패드에서 `LT + B`만 담당
+- 실험자 1명은 게임패드에서 `SELECT`만 담당
 - 별도 하드웨어 e-stop은 손 닿는 위치에 항상 배치
 
 ---
