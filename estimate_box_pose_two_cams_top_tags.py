@@ -75,6 +75,29 @@ def fuse_tag_pose(candidates):
     return T
 
 
+def add_direct_rel_candidates(rel_candidates, tag_dict, margin_dict, origin_id, margin_min):
+    if origin_id not in tag_dict:
+        return
+    origin_margin = margin_dict.get(origin_id, 0.0)
+    if origin_margin < margin_min:
+        return
+    inv_origin = np.linalg.inv(tag_dict[origin_id])
+    for tag_id, T in tag_dict.items():
+        if tag_id == origin_id:
+            continue
+        tag_margin = margin_dict.get(tag_id, 0.0)
+        if tag_margin < margin_min:
+            continue
+        rel_T = inv_origin @ T
+        rel_candidates.setdefault(tag_id, []).append(
+            {
+                "T": rel_T,
+                "w": max(min(origin_margin, tag_margin), 1e-3),
+                "m": tag_margin,
+            }
+        )
+
+
 def rotation_to_euler_xyz_deg(R):
     sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
     singular = sy < 1e-6
@@ -421,6 +444,19 @@ def main():
     parser.add_argument("--fallback-ids", type=str, default="2,3,4,5")
     parser.add_argument("--primary-margin-min", type=float, default=50.0)
     parser.add_argument("--fallback-margin-min", type=float, default=40.0)
+    parser.add_argument(
+        "--fusion-mode",
+        type=str,
+        default="direct_first",
+        choices=["direct_first", "legacy_c2"],
+        help="direct_first: use per-camera origin-relative estimates first, then extrinsic fallback",
+    )
+    parser.add_argument(
+        "--fusion-margin-min",
+        type=float,
+        default=40.0,
+        help="Minimum decision margin to enter fusion candidates",
+    )
     parser.add_argument("--box-half-height", type=float, default=0.16, help="Subtract from tag z to get box center z [m]")
     parser.add_argument("--tag-size", type=float, default=0.077)
     parser.add_argument("--tag-config", type=str, default="config/tag_sizes.json")
@@ -546,6 +582,7 @@ def main():
             f"margin thresholds: primary>={args.primary_margin_min:.1f}, "
             f"fallback>={args.fallback_margin_min:.1f}"
         )
+        print(f"fusion_mode={args.fusion_mode}, fusion_margin_min={args.fusion_margin_min:.1f}")
         print(f"fallback_anchor_ids={fallback_anchor_ids}")
         print(f"box center z offset: +{args.box_half_height:.3f} m")
         print(f"filter_mode={args.filter_mode}")
@@ -584,19 +621,29 @@ def main():
             dets1 = detect_with_tag_sizes(detector, gray1, cam1_params, tag_size, tag_size_map)
             dets2 = detect_with_tag_sizes(detector, gray2, cam2_params, tag_size, tag_size_map)
 
+            cam1_local_tags = {}
+            cam2_local_tags = {}
+            cam1_margin = {}
+            cam2_margin = {}
             fused_candidates = {}
             for det in dets1:
                 draw_detection(img1, det, (0, 255, 255))
                 T_c1_tag = pose_to_T(det.pose_R, det.pose_t)
+                cam1_local_tags[det.tag_id] = T_c1_tag
                 T_c2_tag = T_c2_c1 @ T_c1_tag
                 w = float(getattr(det, "decision_margin", 1.0))
-                fused_candidates.setdefault(det.tag_id, []).append({"T": T_c2_tag, "w": max(1e-3, w)})
+                cam1_margin[det.tag_id] = w
+                if w >= args.fusion_margin_min:
+                    fused_candidates.setdefault(det.tag_id, []).append({"T": T_c2_tag, "w": max(1e-3, w)})
 
             for det in dets2:
                 draw_detection(img2, det, (0, 255, 255))
                 T_c2_tag = pose_to_T(det.pose_R, det.pose_t)
                 w = float(getattr(det, "decision_margin", 1.0))
-                fused_candidates.setdefault(det.tag_id, []).append({"T": T_c2_tag, "w": max(1e-3, w)})
+                cam2_local_tags[det.tag_id] = T_c2_tag
+                cam2_margin[det.tag_id] = w
+                if w >= args.fusion_margin_min:
+                    fused_candidates.setdefault(det.tag_id, []).append({"T": T_c2_tag, "w": max(1e-3, w)})
 
             if not fused_candidates:
                 cv2.putText(img2, "no tags", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -607,12 +654,58 @@ def main():
                 continue
 
             fused_tags_c2 = {tid: fuse_tag_pose(cands) for tid, cands in fused_candidates.items()}
-            fused_margin = {tid: max(c["w"] for c in cands) for tid, cands in fused_candidates.items()}
+            fused_margin_c2 = {tid: max(c["w"] for c in cands) for tid, cands in fused_candidates.items()}
 
             fused_eval, origin_source = inject_origin_from_fallback(
                 fused_tags_c2, args.origin_id, fallback_anchor_ids, anchor_map
             )
-            if args.origin_id not in fused_eval:
+
+            T_o_tag = {}
+            fused_margin = {}
+            direct_tag_count = 0
+            fallback_tag_count = 0
+
+            if args.fusion_mode == "direct_first":
+                direct_rel_candidates = {}
+                add_direct_rel_candidates(
+                    direct_rel_candidates,
+                    cam1_local_tags,
+                    cam1_margin,
+                    args.origin_id,
+                    args.fusion_margin_min,
+                )
+                add_direct_rel_candidates(
+                    direct_rel_candidates,
+                    cam2_local_tags,
+                    cam2_margin,
+                    args.origin_id,
+                    args.fusion_margin_min,
+                )
+                if direct_rel_candidates:
+                    T_o_tag[args.origin_id] = np.eye(4)
+                for tid, cands in direct_rel_candidates.items():
+                    T_o_tag[tid] = fuse_tag_pose(cands)
+                    fused_margin[tid] = max(c["m"] for c in cands)
+                    direct_tag_count += 1
+
+                if args.origin_id in fused_eval:
+                    T_o_c2 = np.linalg.inv(fused_eval[args.origin_id])
+                    T_o_tag.setdefault(args.origin_id, np.eye(4))
+                    for tid, T in fused_eval.items():
+                        if tid == args.origin_id or tid in T_o_tag:
+                            continue
+                        if fused_margin_c2.get(tid, 0.0) < args.fusion_margin_min:
+                            continue
+                        T_o_tag[tid] = T_o_c2 @ T
+                        fused_margin[tid] = fused_margin_c2[tid]
+                        fallback_tag_count += 1
+            else:
+                if args.origin_id in fused_eval:
+                    T_o_c2 = np.linalg.inv(fused_eval[args.origin_id])
+                    T_o_tag = {tid: T_o_c2 @ T for tid, T in fused_eval.items()}
+                    fused_margin = dict(fused_margin_c2)
+
+            if args.origin_id not in T_o_tag:
                 cv2.putText(img2, f"origin {args.origin_id}: N/A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.imshow("cam1", img1)
                 cv2.imshow("cam2", img2)
@@ -620,8 +713,16 @@ def main():
                     break
                 continue
 
-            T_o_c2 = np.linalg.inv(fused_eval[args.origin_id])
-            T_o_tag = {tid: T_o_c2 @ T for tid, T in fused_eval.items()}
+            if args.fusion_mode == "direct_first":
+                cv2.putText(
+                    img2,
+                    f"fusion direct={direct_tag_count} fallback={fallback_tag_count}",
+                    (10, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (180, 255, 180),
+                    2,
+                )
 
             # Update orientation mapping R_primary_fallback when primary is visible
             if args.primary_id in T_o_tag:

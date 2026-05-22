@@ -64,6 +64,36 @@ parser.add_argument(
     default=30,
     help="Color stream FPS"
 )
+parser.add_argument(
+    "--cam1-serial",
+    type=str,
+    default="935322072654",
+    help="Source camera serial (mapped into cam2/world frame)"
+)
+parser.add_argument(
+    "--cam2-serial",
+    type=str,
+    default="115222071236",
+    help="World/reference camera serial"
+)
+parser.add_argument(
+    "--cam1-calib",
+    type=str,
+    default="camera1_935322072654_calibration.npz",
+    help="Calibration npz for cam1"
+)
+parser.add_argument(
+    "--cam2-calib",
+    type=str,
+    default="camera2_115222071236_calibration.npz",
+    help="Calibration npz for cam2"
+)
+parser.add_argument(
+    "--output",
+    type=str,
+    default="camera1_to_camera2_extrinsic.npz",
+    help="Output npz path for extrinsic (key: T_c2_c1)"
+)
 
 args = parser.parse_args()
 
@@ -76,19 +106,11 @@ cli_tag_size_map = parse_tag_size_map(args.tag_size_map)
 _, TAG_SIZE_MAP = merge_tag_sizes(tag_default, cfg_tag_size_map, cli_tag_size_map)
 TAG_SIZE = TAG_SIZE_MAP.get(TARGET_TAG_ID, tag_default)
 
-# =========================================================
-# Camera serials
-# =========================================================
-
-CAM1_SERIAL = "935322072654"  # D435i
-CAM2_SERIAL = "115222071236"  # D435 (WORLD ORIGIN)
-
-# =========================================================
-# Calibration files
-# =========================================================
-
-CAM1_CALIB = "camera1_935322072654_calibration.npz"
-CAM2_CALIB = "camera2_115222071236_calibration.npz"
+CAM1_SERIAL = args.cam1_serial
+CAM2_SERIAL = args.cam2_serial
+CAM1_CALIB = args.cam1_calib
+CAM2_CALIB = args.cam2_calib
+OUTPUT_FILE = args.output
 
 # =========================================================
 # Utility functions
@@ -429,7 +451,7 @@ print(T_avg[:3, 3])
 # =========================================================
 
 np.savez(
-    "camera1_to_camera2_extrinsic.npz",
+    OUTPUT_FILE,
 
     T_c2_c1=T_avg,
 
@@ -444,4 +466,4 @@ np.savez(
 )
 
 print("\nSaved:")
-print("camera1_to_camera2_extrinsic.npz")
+print(OUTPUT_FILE)

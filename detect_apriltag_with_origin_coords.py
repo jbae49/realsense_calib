@@ -9,6 +9,25 @@ What it shows:
   - Per-tag coordinates in origin frame
   - Origin tag coordinate is always [0, 0, 0]
   - Lines from origin tag center to other tag centers
+
+Quick run commands (cam1/cam2/cam3):
+  # cam1 (D435i: 935322072654)
+  # python detect_apriltag_with_origin_coords.py \
+  #   --serial 935322072654 \
+  #   --calib camera1_935322072654_calibration.npz \
+  #   --width 960 --height 540 --fps 60
+  #
+  # cam2 (D435: 115222071236)
+  # python detect_apriltag_with_origin_coords.py \
+  #   --serial 115222071236 \
+  #   --calib camera2_115222071236_calibration.npz \
+  #   --width 960 --height 540 --fps 60
+  #
+  # cam3 (D435: 112322072671)
+  # python detect_apriltag_with_origin_coords.py \
+  #   --serial 112322072671 \
+  #   --calib camera3_112322072671_calibration.npz \
+  #   --width 960 --height 540 --fps 60
 """
 import argparse
 import json
@@ -91,6 +110,11 @@ parser.add_argument("--fallback-anchor-ids", type=str, default="",
 parser.add_argument("--width", type=int, default=640, help="Color stream width")
 parser.add_argument("--height", type=int, default=480, help="Color stream height")
 parser.add_argument("--fps", type=int, default=60, help="Color stream FPS")
+parser.add_argument(
+    "--resizable-window",
+    action="store_true",
+    help="Enable resizable preview window (may look softer when scaled)",
+)
 args = parser.parse_args()
 
 calib = np.load(args.calib)
@@ -133,6 +157,11 @@ print(f"anchor_config={args.anchor_config}")
 print(f"fallback_anchor_ids={fallback_anchor_ids if fallback_anchor_ids else '[]'}")
 print("Coordinates shown under each tag are in ORIGIN frame.")
 print("Press ESC to quit.")
+print(f"window_mode={'resizable' if args.resizable_window else 'fixed (autosize)'}")
+
+if args.resizable_window:
+    cv2.namedWindow("AprilTag Origin Coordinates", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("AprilTag Origin Coordinates", args.width, args.height)
 
 try:
     while True:
