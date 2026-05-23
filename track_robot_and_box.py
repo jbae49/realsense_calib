@@ -9,6 +9,15 @@ Tag layout (current robot setup):
       → torso_pos_pelvis = root_pos + world_z * root_to_torso_z
   - Box tags: ids loaded from --box-tag-map (does NOT include floor origin tag).
 
+Z-sign convention (IMPORTANT):
+  When --origin-id is set to a floor tag, pupil_apriltags returns the tag pose with
+  the local Z axis pointing INTO the page (away from the camera, OpenCV solvePnP
+  convention). For a face-up floor tag this means the world frame +Z axis points
+  DOWN physically. Therefore:
+     +Z  = downward
+     -Z  = upward (toward the ceiling)
+  All default z offsets below assume this convention.
+
 Why two paths?
   Phase A (shadow mode) of apriltag2obs.md: log BOTH torso candidates so we can
   compare them offline against the npz reference and decide a fusion weight.
@@ -16,10 +25,16 @@ Why two paths?
 Outputs:
   - GUI overlay (per-tag axes, computed torso/box, fused if both available).
   - Optional CSV (--csv-out) with one row per frame, all candidates included.
+
+World frame:
+  - default            : world = camera frame (no transform)
+  - --origin-id 1      : world = floor-anchor tag (id=1) frame; everything (head,
+                         pelvis, root, torso, box) is reported in that frame.
+                         If origin tag is briefly out of view, the last seen origin
+                         pose is held (disable with --no-origin-hold).
 """
 import argparse
 import csv
-import json
 import os
 import time
 import cv2
@@ -46,12 +61,22 @@ parser.add_argument("--head-tag-calib", type=str, default="T_tag_torso.npz",
 parser.add_argument("--head-tag-id", type=int, default=9)
 parser.add_argument("--pelvis-tag-ids", type=str, default="8,7",
                     help="Comma-separated pelvis tag ids, e.g. '8,7'")
-parser.add_argument("--head-z-offset", type=float, default=-0.25,
-                    help="World-z offset from head tag to torso_link [m] (fallback when no T_tag_torso.npz)")
-parser.add_argument("--pelvis-to-root-z", type=float, default=0.10,
-                    help="World-z offset from pelvis tag to root (pelvis link) [m]")
-parser.add_argument("--root-to-torso-z", type=float, default=0.20,
-                    help="World-z offset from root to torso_link [m]")
+parser.add_argument("--origin-id", type=int, default=-1,
+                    help="If >=0, use this tag id as the world origin (e.g., 1 for floor anchor). "
+                         "When the origin tag is not visible, last known origin is held.")
+parser.add_argument("--origin-hold", action="store_true", default=True,
+                    help="Hold last seen origin pose when the origin tag is temporarily not visible.")
+parser.add_argument("--no-origin-hold", dest="origin_hold", action="store_false")
+parser.add_argument("--head-z-offset", type=float, default=0.25,
+                    help="World-z offset from head tag to torso_link [m] (fallback when no T_tag_torso.npz). "
+                         "Sign assumes --origin-id is a floor tag: pupil_apriltags Z points into the floor, "
+                         "so +Z = physically down. head→torso (downward 25cm) is +0.25.")
+parser.add_argument("--pelvis-to-root-z", type=float, default=-0.10,
+                    help="World-z offset from pelvis tag to root [m]. Pelvis tag is below root by ~10cm, "
+                         "so going up means -Z (-0.10) under floor-anchor convention.")
+parser.add_argument("--root-to-torso-z", type=float, default=-0.20,
+                    help="World-z offset from root to torso_link [m]. Torso is above root by ~20cm, "
+                         "so going up = -Z (-0.20) under floor-anchor convention.")
 parser.add_argument("--torso-source", type=str, default="fused",
                     choices=["head", "pelvis", "fused"],
                     help="Which torso estimate to display in GUI (CSV always logs all paths)")
@@ -59,18 +84,17 @@ parser.add_argument("--csv-out", type=str, default="",
                     help="If set, write per-frame shadow log to this CSV path")
 parser.add_argument("--print-every", type=int, default=30,
                     help="Print obs line every N frames (0=never)")
+parser.add_argument("--show-box-tags", action="store_true",
+                    help="Show per-box-tag id and positions on GUI (default: hidden, only fused box pose shown)")
+parser.add_argument("--show-robot-tags", action="store_true", default=True,
+                    help="Show per-robot-tag (head/pelvis) positions and torso/root math on GUI")
+parser.add_argument("--no-show-robot-tags", dest="show_robot_tags", action="store_false")
 parser.add_argument("--tag-size", type=float, default=0.077, help="Default AprilTag size in meters")
 parser.add_argument("--tag-config", type=str, default="config/tag_sizes.json")
 parser.add_argument("--tag-size-map", type=str, default="")
 parser.add_argument("--width", type=int, default=960)
 parser.add_argument("--height", type=int, default=540)
 parser.add_argument("--fps", type=int, default=60)
-parser.add_argument("--origin-id", type=int, default=-1,
-                    help="Floor origin tag id (e.g. 1). When set, all coords are reported in origin frame. -1 disables.")
-parser.add_argument("--anchor-config", type=str, default="config/floor_anchor_transforms_cam2.json",
-                    help="JSON file with T_origin_anchor entries for fallback anchors")
-parser.add_argument("--fallback-anchor-ids", type=str, default="10",
-                    help="Comma-separated fallback anchor ids when origin tag is hidden, e.g. '10'")
 args = parser.parse_args()
 
 CAM_SERIAL = args.cam_serial
@@ -171,21 +195,6 @@ def world_z_translate(T_world_X, dz):
     return out
 
 
-def load_anchor_transforms(path: str, origin_id: int):
-    """Load fallback anchors keyed by tag id from a floor_anchor_transforms*.json."""
-    if not path or not os.path.exists(path):
-        return {}
-    data = json.loads(open(path).read())
-    cfg_origin = data.get("origin_id", origin_id)
-    if int(cfg_origin) != int(origin_id):
-        print(f"[origin] WARN anchor config origin_id={cfg_origin} != --origin-id={origin_id}")
-    out = {}
-    for raw_id, meta in (data.get("anchors") or {}).items():
-        if "T_origin_anchor" in meta:
-            out[int(raw_id)] = np.asarray(meta["T_origin_anchor"], dtype=float)
-    return out
-
-
 def draw_detection(img, det, color, label=""):
     corners = det.corners.astype(int)
     for i in range(4):
@@ -223,18 +232,6 @@ map_data = np.load(BOX_TAG_MAP_FILE)
 BOX_T_TAG = {}
 for tag_id, T in zip(map_data["tag_ids"], map_data["box_T_tags"]):
     BOX_T_TAG[int(tag_id)] = T
-# Defensive: never let floor origin / anchor ids be used as box-face candidates.
-# This protects against a stale box_tag_map that picked up a floor tag during registration.
-_origin_excludes = set()
-if int(args.origin_id) >= 0:
-    _origin_excludes.add(int(args.origin_id))
-_origin_excludes |= {int(x) for x in args.fallback_anchor_ids.split(",") if x.strip()}
-_dropped = sorted(_origin_excludes & set(BOX_T_TAG.keys()))
-for _tid in _dropped:
-    BOX_T_TAG.pop(_tid, None)
-if _dropped:
-    print(f"[box-map] dropped ids {_dropped} (origin/anchor) from box candidates "
-          f"to avoid identity collision; check box_tag_map.npz.")
 BOX_TAG_IDS = sorted(BOX_T_TAG.keys())
 
 # Head tag → torso calibration (optional in shadow mode).
@@ -246,21 +243,6 @@ if HEAD_TAG_CALIB_FILE and os.path.exists(HEAD_TAG_CALIB_FILE):
 else:
     print(f"[shadow] {HEAD_TAG_CALIB_FILE} not found; "
           f"falling back to head_z_offset={args.head_z_offset:+.3f} m for head→torso.")
-
-# Origin / floor anchor (optional). When --origin-id >= 0, all coords are reported
-# in the origin tag's local frame instead of the camera optical frame.
-ORIGIN_ID = int(args.origin_id)
-ORIGIN_ENABLED = ORIGIN_ID >= 0
-FALLBACK_ANCHOR_IDS = [int(x) for x in args.fallback_anchor_ids.split(",") if x.strip()]
-ANCHOR_MAP = load_anchor_transforms(args.anchor_config, ORIGIN_ID) if ORIGIN_ENABLED else {}
-FALLBACK_ANCHOR_SET = set(FALLBACK_ANCHOR_IDS)
-T_cam_origin_cache = None  # latched once origin (or anchor) seen, kept under static-cam assumption
-if ORIGIN_ENABLED:
-    print(f"[origin] enabled origin_id={ORIGIN_ID}, fallback_anchors={FALLBACK_ANCHOR_IDS}, "
-          f"anchors_loaded={sorted(ANCHOR_MAP.keys())}")
-else:
-    print("[origin] disabled (camera optical frame is world). "
-          "Pass --origin-id 1 to use floor origin frame.")
 
 # =========================================================
 # Detector + cameras
@@ -291,6 +273,10 @@ print(f"head_z_offset={args.head_z_offset:+.3f} m  (used when T_tag_torso unavai
 print(f"pelvis_to_root_z={args.pelvis_to_root_z:+.3f} m, root_to_torso_z={args.root_to_torso_z:+.3f} m")
 print(f"box_tag_ids={BOX_TAG_IDS}")
 print(f"torso_source(GUI)={args.torso_source}, csv_out={args.csv_out or '(off)'}")
+if args.origin_id >= 0:
+    print(f"origin_id={args.origin_id} (world frame = origin tag, hold={args.origin_hold})")
+else:
+    print("origin_id=(none) -> world frame = camera frame")
 print(f"tag_config={args.tag_config}, default_tag_size={TAG_SIZE}, tag_size_map={TAG_SIZE_MAP}")
 print("Press ESC to quit")
 print("======================================\n")
@@ -301,6 +287,8 @@ print("======================================\n")
 
 CSV_COLUMNS = [
     "frame_idx", "t_sec",
+    # Origin tracking
+    "origin_visible", "origin_held_frames", "origin_source",
     # Raw tag world poses (translations only for compactness)
     "head_visible", "head_pos_x", "head_pos_y", "head_pos_z",
     "head_quat_w", "head_quat_x", "head_quat_y", "head_quat_z", "head_margin",
@@ -361,6 +349,8 @@ def fill_pose(prefix, T):
 
 t_start = time.time()
 frame_idx = 0
+T_cam_origin_held = None         # last known origin tag pose in camera frame
+origin_held_frames = 0
 
 try:
     while True:
@@ -370,86 +360,93 @@ try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         dets = detect_with_tag_sizes(detector, gray, cam_params, TAG_SIZE, TAG_SIZE_MAP)
-        det_by_id = {det.tag_id: det for det in dets}
 
-        # ------ Determine T_cam_origin (= camera-frame pose of the origin frame) ------
-        # Priority: visible origin tag -> visible fallback anchor -> cached value.
-        T_cam_origin_now = None
-        origin_source = None
-        if ORIGIN_ENABLED:
-            if ORIGIN_ID in det_by_id:
-                origin_det = det_by_id[ORIGIN_ID]
-                T_cam_origin_now = pose_to_T(origin_det.pose_R, origin_det.pose_t)
-                origin_source = ORIGIN_ID
-            else:
-                for aid in FALLBACK_ANCHOR_IDS:
-                    if aid in det_by_id and aid in ANCHOR_MAP:
-                        T_cam_anchor = pose_to_T(det_by_id[aid].pose_R, det_by_id[aid].pose_t)
-                        T_anchor_origin = np.linalg.inv(ANCHOR_MAP[aid])
-                        T_cam_origin_now = T_cam_anchor @ T_anchor_origin
-                        origin_source = aid
-                        break
-            if T_cam_origin_now is not None:
-                T_cam_origin_cache = T_cam_origin_now
+        # ------ Origin handling ------
+        # If --origin-id is set, we look for that tag, build T_world<->T_camera transforms,
+        # store every pose in WORLD (origin) frame, and convert back to camera frame only
+        # when drawing (cam_of()).
+        T_cam_origin = None              # origin tag pose in camera frame (this frame or held)
+        origin_visible_now = False
+        origin_source = ""
+        if args.origin_id >= 0:
+            for det in dets:
+                if det.tag_id == args.origin_id:
+                    T_cam_origin = pose_to_T(det.pose_R, det.pose_t)
+                    T_cam_origin_held = T_cam_origin.copy()
+                    origin_held_frames = 0
+                    origin_visible_now = True
+                    origin_source = f"tag{args.origin_id}"
+                    draw_axes(img, K, T_cam_origin, length=0.12)
+                    cv2.putText(img, f"ORIGIN id{args.origin_id}",
+                                tuple(det.center.astype(int) + np.array([10, -10])),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                    break
+            if T_cam_origin is None and args.origin_hold and T_cam_origin_held is not None:
+                T_cam_origin = T_cam_origin_held
+                origin_held_frames += 1
+                origin_source = f"hold({origin_held_frames}f)"
 
-        T_cam_origin = T_cam_origin_cache if ORIGIN_ENABLED else None
+        # World <-> Camera transforms.
+        #   world_T_X = T_world_camera @ cam_T_X   (used for storage/CSV; world = origin tag if set)
+        #   cam_T_X   = T_camera_world @ world_T_X (used to project world poses back onto image)
+        if T_cam_origin is not None:
+            T_camera_world = T_cam_origin                  # origin tag pose in camera frame
+            T_world_camera = np.linalg.inv(T_cam_origin)
+        else:
+            T_camera_world = np.eye(4)
+            T_world_camera = np.eye(4)
 
-        def to_world(T_cam_X):
-            """Convert a cam-frame pose to origin frame. Falls back to identity when origin disabled."""
-            if T_cam_origin is None:
-                return T_cam_X
-            return np.linalg.inv(T_cam_origin) @ T_cam_X
+        def cam_of(T_world_X):
+            """Project a world-frame pose back to camera frame for drawing."""
+            return T_camera_world @ T_world_X
 
-        def to_cam(T_world_X):
-            """Inverse: origin-frame pose back to cam frame for rendering."""
-            if T_cam_origin is None:
-                return T_world_X
-            return T_cam_origin @ T_world_X
-
-        # ------ Collect detections ------
+        # ------ Collect detections (computed in WORLD frame; drawn via cam_of()) ------
         world_T_boxtags = {}
         world_T_headtag = None
         head_margin = 0.0
         world_T_pelvistags = {}
         pelvis_margins = {}
 
-        # Heuristic for "this is a box tag I just don't have in my map yet":
-        # - not the head/pelvis tags
-        # - tag id is small enough to plausibly be a box face (<= 9 covers ids 0..5)
-        # Used only for GUI diagnostics; never feeds box pose estimation.
-        UNMAPPED_BOX_HINT = set(range(0, 10)) - set(BOX_T_TAG.keys()) - {ROBOT_HEAD_TAG_ID} - set(PELVIS_TAG_IDS)
-        if ORIGIN_ENABLED:
-            UNMAPPED_BOX_HINT.discard(ORIGIN_ID)
-            UNMAPPED_BOX_HINT -= FALLBACK_ANCHOR_SET
-
         for det in dets:
             T_cam_tag = pose_to_T(det.pose_R, det.pose_t)
-            T_world_tag = to_world(T_cam_tag)
+            T_world_tag = T_world_camera @ T_cam_tag
             margin = float(getattr(det, "decision_margin", 0.0))
 
             if det.tag_id in BOX_T_TAG:
                 world_T_boxtags[det.tag_id] = T_world_tag
                 draw_detection(img, det, (0, 255, 255))
                 draw_axes(img, K, T_cam_tag, length=0.05)
-            elif det.tag_id in UNMAPPED_BOX_HINT:
-                draw_detection(img, det, (160, 160, 160), f"BOX?:{det.tag_id} (unmapped)")
-                draw_axes(img, K, T_cam_tag, length=0.04)
+                if args.show_box_tags:
+                    tp = T_world_tag[:3, 3]
+                    center = tuple(det.center.astype(int))
+                    cv2.putText(img,
+                                f"id{det.tag_id} [{tp[0]:+.2f},{tp[1]:+.2f},{tp[2]:+.2f}] m:{margin:.0f}",
+                                (center[0] + 10, center[1] + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
             elif det.tag_id == ROBOT_HEAD_TAG_ID:
                 world_T_headtag = T_world_tag
                 head_margin = margin
                 draw_detection(img, det, (255, 0, 255), f"HEAD:{det.tag_id}")
                 draw_axes(img, K, T_cam_tag, length=0.05)
+                if args.show_robot_tags:
+                    tp = T_world_tag[:3, 3]
+                    center = tuple(det.center.astype(int))
+                    cv2.putText(img,
+                                f"head [{tp[0]:+.2f},{tp[1]:+.2f},{tp[2]:+.2f}] m:{margin:.0f}",
+                                (center[0] + 10, center[1] + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
             elif det.tag_id in PELVIS_TAG_IDS:
                 world_T_pelvistags[det.tag_id] = T_world_tag
                 pelvis_margins[det.tag_id] = margin
                 draw_detection(img, det, (0, 200, 255), f"PELVIS:{det.tag_id}")
                 draw_axes(img, K, T_cam_tag, length=0.05)
-            elif ORIGIN_ENABLED and det.tag_id == ORIGIN_ID:
-                draw_detection(img, det, (0, 255, 0), f"ORIGIN:{det.tag_id}")
-                draw_axes(img, K, T_cam_tag, length=0.10)
-            elif ORIGIN_ENABLED and det.tag_id in FALLBACK_ANCHOR_SET:
-                draw_detection(img, det, (0, 255, 128), f"ANCHOR:{det.tag_id}")
-                draw_axes(img, K, T_cam_tag, length=0.06)
+                if args.show_robot_tags:
+                    tp = T_world_tag[:3, 3]
+                    center = tuple(det.center.astype(int))
+                    cv2.putText(img,
+                                f"pelvis{det.tag_id} [{tp[0]:+.2f},{tp[1]:+.2f},{tp[2]:+.2f}] m:{margin:.0f}",
+                                (center[0] + 10, center[1] + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
 
         # ------ Path A: head-tag → torso ------
         world_T_torso_head = None
@@ -498,18 +495,14 @@ try:
             gui_torso = world_T_torso_pelvis
 
         if gui_torso is not None:
-            draw_axes(img, K, to_cam(gui_torso), length=0.15)
-
-        # Draw root and pelvis-derived torso so both paths are visible at once.
-        if world_T_root is not None:
-            draw_axes(img, K, to_cam(world_T_root), length=0.08)
-        if world_T_torso_pelvis is not None and args.torso_source != "pelvis":
-            draw_axes(img, K, to_cam(world_T_torso_pelvis), length=0.08)
-        if world_T_torso_head is not None and args.torso_source != "head":
-            draw_axes(img, K, to_cam(world_T_torso_head), length=0.08)
+            draw_axes(img, K, cam_of(gui_torso), length=0.15)
 
         # ------ Box pose ------
+        # Per-tag candidates: each visible box tag gives an estimate of the box origin in world.
+        #   T_world_box_from_tag_i = T_world_tag_i @ inv(T_box_tag_i)
+        # Final box pose = simple mean over visible tags (no margin weighting here).
         world_T_box = None
+        per_tag_box_candidate = {}    # tag_id -> world_T_box estimate from that tag
         if len(world_T_boxtags) > 0:
             positions = []
             rotations = []
@@ -517,72 +510,34 @@ try:
                 if tag_id not in BOX_T_TAG:
                     continue
                 world_T_box_candidate = T_world_tag @ np.linalg.inv(BOX_T_TAG[tag_id])
+                per_tag_box_candidate[tag_id] = world_T_box_candidate
                 positions.append(world_T_box_candidate[:3, 3])
                 rotations.append(world_T_box_candidate[:3, :3])
             if len(positions) > 0:
                 world_T_box = np.eye(4)
                 world_T_box[:3, 3] = np.mean(np.stack(positions), axis=0)
                 world_T_box[:3, :3] = average_rotation(rotations)
-        if world_T_box is not None:
-            draw_axes(img, K, to_cam(world_T_box), length=0.10)
 
         # ------ GUI overlay ------
         y = 30
-        if ORIGIN_ENABLED:
-            if T_cam_origin is None:
-                origin_msg = "ORIGIN: NOT YET (need tag {} or anchor {})".format(
-                    ORIGIN_ID, FALLBACK_ANCHOR_IDS)
-                origin_color = (0, 0, 255)
-            elif origin_source == ORIGIN_ID:
-                origin_msg = f"ORIGIN: visible (id={ORIGIN_ID})"
-                origin_color = (0, 255, 0)
-            elif origin_source is not None:
-                origin_msg = f"ORIGIN: via anchor {origin_source}"
-                origin_color = (0, 255, 128)
+        if args.origin_id >= 0:
+            if origin_visible_now:
+                origin_str = f"ORIGIN id{args.origin_id}: LIVE"
+                origin_col = (0, 255, 0)
+            elif T_cam_origin is not None:
+                origin_str = f"ORIGIN id{args.origin_id}: HOLD ({origin_held_frames}f)"
+                origin_col = (0, 200, 255)
             else:
-                origin_msg = f"ORIGIN: cached (latched)"
-                origin_color = (0, 200, 255)
-            cv2.putText(img, origin_msg, (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, origin_color, 2)
-        else:
-            cv2.putText(img, "ORIGIN: disabled (cam frame = world)", (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
-        y += 22
+                origin_str = f"ORIGIN id{args.origin_id}: NOT SEEN (world=cam)"
+                origin_col = (0, 0, 255)
+            cv2.putText(img, origin_str, (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, origin_col, 2)
+            y += 22
         cv2.putText(img, f"head:{ROBOT_HEAD_TAG_ID} {'OK' if world_T_headtag is not None else '--'}  "
                          f"pelvis:{PELVIS_TAG_IDS} {pelvis_used_id if pelvis_used_id>=0 else '--'}  "
                          f"box_tags:{len(world_T_boxtags)}",
                     (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         y += 25
-        if world_T_headtag is not None:
-            hp = world_T_headtag[:3, 3]
-            cv2.putText(img,
-                        f"HeadTag(id={ROBOT_HEAD_TAG_ID}): [{hp[0]:+.3f}, {hp[1]:+.3f}, {hp[2]:+.3f}]  m={head_margin:.0f}",
-                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
-            y += 22
-        if world_T_pelvis_avg is not None:
-            pp = world_T_pelvis_avg[:3, 3]
-            cv2.putText(img,
-                        f"PelvisTag(id={pelvis_used_id}): [{pp[0]:+.3f}, {pp[1]:+.3f}, {pp[2]:+.3f}]  m={pelvis_margin_max:.0f}",
-                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
-            y += 22
-        if world_T_root is not None:
-            rp = world_T_root[:3, 3]
-            cv2.putText(img,
-                        f"Root (pelvis+{args.pelvis_to_root_z:+.2f}z): [{rp[0]:+.3f}, {rp[1]:+.3f}, {rp[2]:+.3f}]",
-                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 2)
-            y += 22
-        if world_T_torso_head is not None:
-            thp = world_T_torso_head[:3, 3]
-            cv2.putText(img,
-                        f"Torso<head>: [{thp[0]:+.3f}, {thp[1]:+.3f}, {thp[2]:+.3f}]",
-                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 130, 220), 2)
-            y += 20
-        if world_T_torso_pelvis is not None:
-            tpp = world_T_torso_pelvis[:3, 3]
-            cv2.putText(img,
-                        f"Torso<pelvis>: [{tpp[0]:+.3f}, {tpp[1]:+.3f}, {tpp[2]:+.3f}]",
-                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (130, 200, 220), 2)
-            y += 20
         if gui_torso is not None:
             tp = gui_torso[:3, 3]
             cv2.putText(img,
@@ -605,6 +560,86 @@ try:
             cv2.putText(img, "Box: NOT VISIBLE", (10, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
+        # ------ Right-side panels (shared py cursor) ------
+        panel_w = 380
+        panel_x = max(10, img.shape[1] - panel_w - 10)
+        py = 30
+
+        # ------ Per-box-tag panel (only when --show-box-tags) ------
+        if args.show_box_tags and (len(world_T_boxtags) > 0 or world_T_box is not None):
+            cv2.putText(img, "Box tags (world m)", (panel_x, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+            py += 22
+            for tag_id in sorted(world_T_boxtags.keys()):
+                tp = world_T_boxtags[tag_id][:3, 3]
+                cv2.putText(
+                    img,
+                    f"id{tag_id}: [{tp[0]:+.3f},{tp[1]:+.3f},{tp[2]:+.3f}]",
+                    (panel_x, py),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1,
+                )
+                py += 18
+            if per_tag_box_candidate:
+                py += 6
+                cv2.putText(img, "Box origin candidates (per tag)", (panel_x, py),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 220, 220), 1)
+                py += 18
+                for tag_id in sorted(per_tag_box_candidate.keys()):
+                    bp = per_tag_box_candidate[tag_id][:3, 3]
+                    cv2.putText(
+                        img,
+                        f"  via id{tag_id}: [{bp[0]:+.3f},{bp[1]:+.3f},{bp[2]:+.3f}]",
+                        (panel_x, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1,
+                    )
+                    py += 16
+            if world_T_box is not None:
+                bp = world_T_box[:3, 3]
+                py += 6
+                cv2.putText(
+                    img,
+                    f"Box(mean): [{bp[0]:+.3f},{bp[1]:+.3f},{bp[2]:+.3f}]",
+                    (panel_x, py),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
+                )
+
+        # ------ Robot math panel (how root/torso are computed) ------
+        if args.show_robot_tags:
+            if py > 30:
+                py += 8
+            cv2.putText(img, "Robot pose math", (panel_x, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 255), 2)
+            py += 22
+
+            head_src = "head_calib(npz)" if T_tag_torso is not None else f"head + z*{args.head_z_offset:+.2f}"
+            cv2.putText(img, f"torso_head = {head_src}",
+                        (panel_x, py), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            py += 16
+            cv2.putText(img, f"root  = pelvis + z*{args.pelvis_to_root_z:+.2f}",
+                        (panel_x, py), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            py += 16
+            cv2.putText(img, f"torso_pelvis = root + z*{args.root_to_torso_z:+.2f}",
+                        (panel_x, py), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            py += 20
+
+            for label, T, color in [
+                (f"head(id{ROBOT_HEAD_TAG_ID})", world_T_headtag, (255, 0, 255)),
+                (f"pelvis(id{pelvis_used_id if pelvis_used_id>=0 else '-'})",
+                    world_T_pelvis_avg, (0, 200, 255)),
+                ("root",        world_T_root,         (0, 200, 255)),
+                ("torso_head",  world_T_torso_head,   (255, 100, 255)),
+                ("torso_pelvis",world_T_torso_pelvis, (255, 100, 255)),
+                (f"torso({torso_path or '--'})", world_T_torso, (255, 0, 255)),
+            ]:
+                if T is None:
+                    txt = f"{label}: --"
+                else:
+                    p = T[:3, 3]
+                    txt = f"{label}: [{p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f}]"
+                cv2.putText(img, txt, (panel_x, py),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+                py += 16
+
         # ------ Console (throttled) ------
         if args.print_every > 0 and frame_idx % args.print_every == 0 and gui_torso is not None and world_T_box is not None:
             tp = gui_torso[:3, 3]
@@ -614,13 +649,13 @@ try:
                   f"box=[{bp[0]:+.3f},{bp[1]:+.3f},{bp[2]:+.3f}] rel=[{rel[0]:+.3f},{rel[1]:+.3f},{rel[2]:+.3f}]")
 
         # ------ CSV row ------
-        # When origin mode is on but origin is not yet acquired, skip logging:
-        # otherwise frames in cam-frame would silently mix with origin-frame frames.
-        skip_csv = ORIGIN_ENABLED and T_cam_origin is None
-        if csv_writer is not None and not skip_csv:
+        if csv_writer is not None:
             row = csv_row({
                 "frame_idx": frame_idx,
                 "t_sec": time.time() - t_start,
+                "origin_visible": int(origin_visible_now),
+                "origin_held_frames": int(origin_held_frames),
+                "origin_source": origin_source,
                 "head_visible": int(world_T_headtag is not None),
                 "head_margin": head_margin,
                 "pelvis_visible": int(world_T_pelvis_avg is not None),

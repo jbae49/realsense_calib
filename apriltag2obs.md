@@ -35,17 +35,19 @@
 
 | Tag ID | 위치 | 의미 | 고정 오프셋 |
 |---|---|---|---|
-| `9` | 머리 위 | 머리 태그 | tag → torso_link: 머리 기준 **z 방향 -25 cm** |
-| `8`, `7` | pelvis 살짝 아래 | pelvis 태그 | tag → root(pelvis): **z 방향 +10 cm** |
+| `9` | 머리 위 | 머리 태그 | tag → torso_link: **+25 cm in world z (=아래로 25 cm)** |
+| `8`, `7` | pelvis 살짝 아래 | pelvis 태그 | tag → root(pelvis): **-10 cm in world z (=위로 10 cm)** |
 | `0~5` | 박스 위 | 박스 태그 (이미 사용중) | `box_tag_map.npz` 기준 |
 | `1` | 바닥 | 실험실 origin (옵션) | floor anchor |
 
 추가 사실 (사용자 제공):
 - pelvis(root) → torso_link는 **z 방향 +20 cm** 정도
 - 따라서 torso position은 두 경로로 추정 가능:
-  - **경로 A (pelvis tag)**: `T_world_root = T_world_pelvisTag * (z+0.10)`,  
-    `T_world_torso ≈ T_world_root * (z+0.20, ori는 root quat 기준)`
-  - **경로 B (head tag)**: `T_world_torso = T_world_headTag * (z-0.25)`
+  좌표 컨벤션: floor tag(예: id=1)를 `--origin-id`로 쓰면 pupil_apriltags의 Z축이
+  태그 뒷면(=지면 속) 방향이라서 **+Z = 아래, −Z = 위** 가 됩니다. 모든 z 부호는 이 가정 기준.
+  - **경로 A (pelvis tag)**: `T_world_root = T_world_pelvisTag * (z = −0.10)` (위로 10cm),
+    `T_world_torso ≈ T_world_root * (z = −0.20, ori는 root quat 기준)` (위로 20cm)
+  - **경로 B (head tag)**: `T_world_torso = T_world_headTag * (z = +0.25)` (아래로 25cm)
 
 > **torso orientation 자체는 새로 만들지 말고**, 기존 `motion_anchor_ori_b` 코드를 그대로 사용한다  
 > (IMU root quat + waist 3축 모터각). 즉 외부 비전은 **위치 위주**로만 우선 활용.

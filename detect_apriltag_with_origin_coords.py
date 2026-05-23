@@ -115,6 +115,22 @@ parser.add_argument(
     action="store_true",
     help="Enable resizable preview window (may look softer when scaled)",
 )
+parser.add_argument(
+    "--show-camera-coords",
+    action="store_true",
+    help="Also display each tag's position in the camera frame (for debugging)",
+)
+parser.add_argument(
+    "--show-distance-check",
+    action="store_true",
+    help="Show |t_cam-tag - t_cam-origin| vs |t_origin-tag| (must match if math is correct)",
+)
+parser.add_argument(
+    "--debug-print-every",
+    type=int,
+    default=0,
+    help="If >0, every N frames print T_cam_origin, R_origin_cam, and per-tag positions to console",
+)
 args = parser.parse_args()
 
 calib = np.load(args.calib)
@@ -163,8 +179,10 @@ if args.resizable_window:
     cv2.namedWindow("AprilTag Origin Coordinates", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("AprilTag Origin Coordinates", args.width, args.height)
 
+frame_idx = 0
 try:
     while True:
+        frame_idx += 1
         frames = pipeline.wait_for_frames()
         color_frame = frames.get_color_frame()
         if not color_frame:
@@ -230,33 +248,66 @@ try:
                 2,
             )
 
+            T_cam_tag_self = pose_to_T(det.pose_R, det.pose_t)
+            cam_pos = T_cam_tag_self[:3, 3]
+
+            text_y = center[1] + 5
             if T_cam_origin is not None:
                 if det.tag_id == args.origin_id:
                     rel = np.zeros(3)
+                    d_origin = 0.0
+                    d_cam = 0.0
                 else:
-                    T_cam_tag = pose_to_T(det.pose_R, det.pose_t)
-                    T_origin_tag = np.linalg.inv(T_cam_origin) @ T_cam_tag
+                    T_origin_tag = np.linalg.inv(T_cam_origin) @ T_cam_tag_self
                     rel = T_origin_tag[:3, 3]
+                    d_origin = float(np.linalg.norm(rel))
+                    d_cam = float(np.linalg.norm(cam_pos - T_cam_origin[:3, 3]))
 
                 cv2.putText(
                     img,
                     f"rel: [{rel[0]:+.3f}, {rel[1]:+.3f}, {rel[2]:+.3f}] m",
-                    (center[0] + 10, center[1] + 5),
+                    (center[0] + 10, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.42,
                     (255, 255, 255),
                     1,
                 )
+                text_y += 16
                 if origin_center is not None and det.tag_id != args.origin_id:
                     cv2.line(img, origin_center, center, (255, 255, 0), 2)
+
+                if args.show_distance_check and det.tag_id != args.origin_id:
+                    color = (0, 255, 0) if abs(d_cam - d_origin) < 0.005 else (0, 0, 255)
+                    cv2.putText(
+                        img,
+                        f"|d|: cam={d_cam:.3f}  origin={d_origin:.3f}  diff={d_cam - d_origin:+.3f} m",
+                        (center[0] + 10, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        color,
+                        1,
+                    )
+                    text_y += 16
             else:
                 cv2.putText(
                     img,
                     "rel: N/A (origin not visible)",
-                    (center[0] + 10, center[1] + 5),
+                    (center[0] + 10, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.42,
                     (0, 0, 255),
+                    1,
+                )
+                text_y += 16
+
+            if args.show_camera_coords:
+                cv2.putText(
+                    img,
+                    f"cam: [{cam_pos[0]:+.3f}, {cam_pos[1]:+.3f}, {cam_pos[2]:+.3f}] m",
+                    (center[0] + 10, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    (180, 200, 255),
                     1,
                 )
 
@@ -291,6 +342,38 @@ try:
                 (0, 255, 0),
                 2,
             )
+
+        if args.debug_print_every > 0 and frame_idx % args.debug_print_every == 0:
+            print(f"\n[debug frame {frame_idx}] ----------------------------------------")
+            if T_cam_origin is None:
+                print("  origin not visible (and no fallback anchor)")
+            else:
+                R_co = T_cam_origin[:3, :3]
+                t_co = T_cam_origin[:3, 3]
+                R_oc = R_co.T
+                print("  T_cam_origin:")
+                print(f"    R_cam_origin =\n{R_co}")
+                print(f"    t_cam_origin = {t_co}")
+                print(f"    R_origin_cam[2,2] = {R_oc[2, 2]:+.4f}  "
+                      f"(== cos(angle between cam_z and origin_z))")
+                for det in detections:
+                    if det.tag_id == args.origin_id:
+                        continue
+                    T_ct = pose_to_T(det.pose_R, det.pose_t)
+                    t_ct = T_ct[:3, 3]
+                    delta_cam = t_ct - t_co
+                    t_ot = (np.linalg.inv(T_cam_origin) @ T_ct)[:3, 3]
+                    print(
+                        f"  id{det.tag_id}: "
+                        f"t_cam={t_ct.round(3).tolist()}  "
+                        f"Δt_cam={delta_cam.round(3).tolist()}  |Δ|={np.linalg.norm(delta_cam):.3f}  "
+                        f"t_origin={t_ot.round(3).tolist()}  |t_o|={np.linalg.norm(t_ot):.3f}"
+                    )
+                    print(
+                        f"     check  |Δt_cam| - |t_origin| = "
+                        f"{np.linalg.norm(delta_cam) - np.linalg.norm(t_ot):+.6f} m  "
+                        f"(must be ~0 if math is correct)"
+                    )
 
         cv2.imshow("AprilTag Origin Coordinates", img)
         if (cv2.waitKey(1) & 0xFF) == 27:
