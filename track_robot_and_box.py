@@ -71,9 +71,9 @@ parser.add_argument("--head-z-offset", type=float, default=0.25,
                     help="World-z offset from head tag to torso_link [m] (fallback when no T_tag_torso.npz). "
                          "Sign assumes --origin-id is a floor tag: pupil_apriltags Z points into the floor, "
                          "so +Z = physically down. head→torso (downward 25cm) is +0.25.")
-parser.add_argument("--pelvis-to-root-z", type=float, default=-0.10,
-                    help="World-z offset from pelvis tag to root [m]. Pelvis tag is below root by ~10cm, "
-                         "so going up means -Z (-0.10) under floor-anchor convention.")
+parser.add_argument("--pelvis-to-root-z", type=float, default=-0.05,
+                    help="World-z offset from pelvis tag to root [m]. Pelvis tag is below root by ~5cm, "
+                         "so going up means -Z (-0.05) under floor-anchor convention.")
 parser.add_argument("--root-to-torso-z", type=float, default=-0.20,
                     help="World-z offset from root to torso_link [m]. Torso is above root by ~20cm, "
                          "so going up = -Z (-0.20) under floor-anchor convention.")

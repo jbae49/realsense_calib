@@ -1,0 +1,62 @@
+{
+  "src_npz": "humanoid_project/src/assets/OmniRetarget/processed/sub8_largebox_045_original.npz",
+  "csv": "outputs/test_actor_obs_20260523_152217.csv",
+  "out_npz": "outputs/sub8_45_coords_processed_v1.npz",
+  "torso_body_idx": 16,
+  "num_frames_used": 12,
+  "yaw_source": "torso_to_obj",
+  "yaw_lab_deg": -102.95849212519974,
+  "R_lab_world": [
+    [
+      -0.22424511387771412,
+      -0.9745327746679282,
+      0.0
+    ],
+    [
+      -0.9745327746679282,
+      0.22424511387771412,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      -1.0
+    ]
+  ],
+  "t_lab_world_m": [
+    0.013933979318752177,
+    -0.3218525307080674,
+    0.03649041103679518
+  ],
+  "frame0_residuals": {
+    "torso_pos_mm": 4.038716041155951e-05,
+    "obj_pos_mm": 155.49799100991973,
+    "torso_to_obj_yaw_deg": -2.8962721749244414e-06,
+    "torso_rot_yaw_deg": -111.0769318033475,
+    "torso_rot_R_total_deg": 163.00821828213105,
+    "obj_rot_R_total_deg": 21.773970641682777
+  },
+  "csv_anchor": {
+    "torso_pos_mean_m": [
+      -0.2947884523271326,
+      0.8026160917195934,
+      -1.0231714541975798
+    ],
+    "torso_pos_std_mm": [
+      25.52756395743151,
+      14.278497212906574,
+      22.31141547505257
+    ],
+    "obj_pos_mean_m": [
+      0.10939205122238337,
+      0.9757145832858822,
+      -0.198146416694413
+    ],
+    "obj_pos_std_mm": [
+      4.1940101927091415,
+      9.078372863993721,
+      10.503456578827116
+    ]
+  },
+  "method": "yaw + translation alignment with fixed Rx(180) gravity flip; yaw source = torso_to_obj"
+}

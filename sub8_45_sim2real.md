@@ -9,7 +9,8 @@
 - 현재 버튼 매핑(기본):
   - `LT + up` (`L2 + up`): `Passive -> FixStand`
   - `RT + A` (`R2 + A`): `FixStand -> Velocity`
-  - `RB + B` (`R1 + B`): `Velocity -> Mimic_Sub8_45`
+  - `RB + B` (`R1 + B`): `Velocity -> Mimic_Sub8_45` (proprio + npz only)
+  - `RB + Y` (`R1 + Y`): `Velocity -> Mimic_Sub8_45_TagHistory` (카메라 obs 사용, §17 참고)
   - `SELECT`: `FixStand/Velocity/Mimic -> Passive` (빠른 소프트 정지 복귀)
 
 ---
@@ -46,12 +47,14 @@
 
 1. `LT + up` (`L2 + up`) -> `FixStand`
 2. `RT + A` (`R2 + A`) -> `Velocity`
-3. `RB + B` (`R1 + B`) -> `Mimic_Sub8_45` (sub8 extended onnx)
-4. 언제든 `SELECT` -> `Passive` (안전 복귀)
+3. `RB + B` (`R1 + B`) -> `Mimic_Sub8_45` (sub8 extended onnx, proprio + npz only)
+4. `RB + Y` (`R1 + Y`) -> `Mimic_Sub8_45_TagHistory` (카메라 obs 사용, §17 참고)
+5. 언제든 `SELECT` -> `Passive` (안전 복귀)
 
 실무 권장:
-- **정상 진입 순서**: `Passive -> FixStand -> Velocity -> Mimic_Sub8_45`
+- **정상 진입 순서**: `Passive -> FixStand -> Velocity -> Mimic_*`
 - mimic을 바로 켜기보다, `Velocity`에서 자세/균형/입력 상태를 2~3초 확인 후 mimic으로 전환
+- `R1+Y` 누르기 전에는 반드시 PC 트래커 (`track_robot_and_box_multicam.py --udp-publish`) 가 먼저 떠있어야 함. 안 그러면 g1_ctrl 콘솔에 `[cam] warm-up TIMEOUT` 경고 뜨고 첫 step 의 카메라 obs 가 비어있게 됨 (§17-5).
 
 ### 0-4. 네트워크 확인 커맨드 (실기)
 
@@ -60,12 +63,83 @@ ip -br a
 ping -c 3 192.168.123.161
 ```
 
-예시 실행:
+기본 mimic (proprio + npz only, 카메라 무관) 실행:
 
 ```bash
 cd /home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/build
-./g1_ctrl --network=eno1
+./g1_ctrl --network=eno1 --log
 ```
+
+#### `Mimic_Sub8_45_TagHistory` (카메라 obs 사용 정책) 정확한 순서
+
+> **순서가 매우 중요**. `g1_ctrl` 은 startup 시점에 NPZ 를 **constructor 에서 한 번만** 로드함 (`State_Mimic.cpp:339`). g1_ctrl 시작 후에 NPZ 파일을 수정/교체해도 메모리에 반영 안 됨. 따라서 **alignment → g1_ctrl 실행** 순서 깨면 어제와 같은 즉시 fall 재발.
+
+```bash
+# (전제) 로봇 전원 ON, 컨트롤러 L2+R2 (debug) 까지 들어간 상태,
+# 컨트롤러 L2+up 으로 FixStand 진입해서 로봇이 시작 자세에서 안정화됨
+
+# === 1) 시작 자세 CSV 캡처 — tracker 잠깐 켰다가 끔 ============
+cd /home/roy/realsense_calib
+TS=$(date +%Y%m%d_%H%M%S)
+python track_robot_and_box_multicam.py \
+  --cam1-serial 935322072654 --cam2-serial 115222071236 --cam3-serial 112322072671 \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --cam3-calib camera3_112322072671_calibration.npz \
+  --origin-id 1 --anchor-ids 10 --margin-min 20 \
+  --detector-quad-decimate 1.5 --no-show-cam-windows \
+  --csv-out outputs/start_pose_${TS}.csv --print-every 30
+# 콘솔에서 head_visible/torso_visible 둘 다 잘 나오는지 ~5초 확인 후 Ctrl+C
+
+# === 2) NPZ 를 새 시작 자세에 맞춰 정렬 ========================
+python align_npz_to_lab.py \
+  --obs-csv outputs/start_pose_${TS}.csv \
+  --ref-npz unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45_tag_history/params/sub8_largebox_045_original_extended.npz \
+  --out-npz unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45_tag_history/params/sub8_45_extended_coords_processed_v2.npz
+# 출력 경로는 deploy.yaml/config.yaml 의 motion_file 과 정확히 일치해야 함.
+#
+# ★ 출력 마지막 "Post-alignment residuals at frame 0" 블록을 반드시 확인:
+#       torso pos err :  ✓ OK   (보통 ~0)
+#       torso rot err :  ✓ OK   (< 5° 이상적, > 10° 면 FAIL)
+#       obj   pos err :  ✓ OK   (< 50 mm 이상적, > 100 mm 면 FAIL)
+#       obj   rot err :  ✓ OK   (< 10° 이상적, > 15° 면 FAIL)
+# 하나라도 FAIL 이 뜨면 스크립트가 non-zero exit 하고 "🚨 ALIGNMENT QUALITY
+# FAILED" 출력. 이 경우 NPZ 가 deploy 에 안전하지 않음 — 시작 자세 csv 다시 캡처.
+# 자주 보는 원인: head/pelvis tag 가 시작 자세에서 가려짐, 로봇이 csv 캡처 동안
+# 흔들림, 박스가 npz frame 0 의 위치와 크게 다른 곳에 놓임.
+
+# === 3) (선택) MuJoCo 시각 검증 =============================
+python visualize_aligned_npz_mujoco.py \
+  --npz unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45_tag_history/params/sub8_45_extended_coords_processed_v2.npz \
+  --frame sim
+# 발이 floor 에 잘 닿고, 박스 trajectory 가 현실적인지 눈으로 확인. 이상하면 1) 로 돌아감.
+
+# === 4) tracker 다시 (이번에는 --udp-publish 로) ============
+python track_robot_and_box_multicam.py \
+  --cam1-serial 935322072654 --cam2-serial 115222071236 --cam3-serial 112322072671 \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --cam3-calib camera3_112322072671_calibration.npz \
+  --origin-id 1 --anchor-ids 10 --margin-min 20 \
+  --detector-quad-decimate 1.5 --no-show-cam-windows \
+  --udp-publish \
+  --csv-out outputs/sub8_45_taghist_${TS}.csv --print-every 30
+# 콘솔에 'UDP publish -> 127.0.0.1:9999' + 'UDP packets sent: N (~50/s)' 확인. 절대 끄지 말 것.
+
+# === 5) 다른 터미널에서 g1_ctrl 시작 (NPZ 가 step 2 에서 갱신된 후) ===
+cd /home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/build
+./g1_ctrl --network=eno1 --log
+# 시작 로그에 'Loaded motion file sub8_45_extended_coords_processed_v2 with duration X.XXs' 확인.
+
+# === 6) 조이스틱 ============================================
+# L2+up   -> FixStand   (이미 1)에서 들어가 있을 것)
+# R2+A    -> Velocity
+#         (콘솔에 [cam] warm-up ok: first packet received (recv_count=N) 보일 때까지 대기)
+# R1+Y    -> Mimic_Sub8_45_TagHistory
+#  (이상 시 SELECT -> Passive)
+```
+
+만약 시작 자세가 변경되면 (예: 로봇 위치 이동, 배터리 교체로 origin 다시 캘리브레이션) **반드시 1)–5) 를 다시**. tracker 만 재시작하고 g1_ctrl 그대로 두면 메모리상 NPZ 는 옛 정합 상태라 motion_anchor_pos_b 첫 step 이 큰 값 → fall.
 
 ### 0-5. "터미널에 전환 안내가 자동으로 뜨나?"에 대한 답
 
@@ -932,4 +1006,172 @@ ls -la /home/roy/realsense_calib/humanoid_project/deploy/robots/g1/config/policy
 요약하면, `unitree_rl_mjlab`은 "proprio only" 한 종류가 아니라
 task마다 obs가 다르고, tracking/mimic 계열은 `npz reference + 현재 state`
 를 결합한 상대표현 obs를 사용한다.
+
+---
+
+## 17) Tag-history 정책 (sub8_45_tag_history) deploy
+
+기존 `sub8_45` 정책은 **proprio + npz**만 obs로 받음 (카메라 무관). 새 `sub8_45_tag_history`
+정책은 actor obs 12개 중 **5개가 카메라 기반**:
+
+| obs | 의미 | 소스 |
+|---|---|---|
+| `motion_anchor_pos_b` | ref torso pos (lab) − robot torso pos, 로봇 torso body frame에서 | 카메라 (torso) + npz (ref) |
+| `object_pos_torso` | 박스 pos − robot torso pos, body frame | 카메라 (박스 + torso) |
+| `object_ori6_torso` | 박스 quat 을 robot torso frame으로 (rot6d) | 카메라 (박스 + torso) |
+| `ref_object_pos_torso` | npz의 박스 pos − robot torso pos, body frame | 카메라 (torso) + npz (ref) |
+| `ref_object_ori6_torso` | npz 박스 quat을 robot torso frame으로 (rot6d) | 카메라 (torso) + npz (ref) |
+
+→ **멀티캠 트래커가 매 프레임 torso/box pose를 UDP로 송신**, deploy 측 subscriber 가 latest snapshot 을 mutex-protect 해서 정책 step마다 읽음.
+
+### 17-1. 아키텍처
+
+기본 (PC-only, 권장) — 한 머신에서 트래커 + g1_ctrl 둘 다 실행:
+
+```
+[3× RealSense] -USB-> [PC]
+                       ├─ track_robot_and_box_multicam.py --udp-publish
+                       │     └─ UDP ASCII 17-fields packet -> 127.0.0.1:9999  (loopback, <1ms)
+                       └─ g1_ctrl  (같은 PC)
+                            ├─ camera_pose_subscriber  (UDP 9999 listener)
+                            ├─ State_Mimic obs functions
+                            ├─ ONNX policy (50 Hz)
+                            └─ DDS  ─wired ethernet─> [로봇 192.168.123.161]
+```
+
+옵션 (split-machine, legacy) — 트래커는 PC, g1_ctrl 은 Jetson:
+
+```
+[3× RealSense] -USB-> [PC]                                  [Jetson]
+                       └─ tracker --udp-host 192.168.123.164 ─→ camera_pose_subscriber
+                                                                 └─ g1_ctrl ─→ 로봇
+```
+
+세 가지 구성 요소는 두 모드 모두에서 동일하게 사용됨:
+- Publisher: `track_robot_and_box_multicam.py` (`--udp-publish` 플래그)
+- Subscriber: `unitree_rl_mjlab/deploy/include/camera_pose_subscriber.h`
+- Obs 함수: `unitree_rl_mjlab/deploy/robots/g1/src/State_Mimic.cpp`
+
+> **PC-only 가 권장되는 이유**: ① UDP loopback latency 가 마이크로초 단위라 staleness/지터 우려 사라짐, ② NTP 동기화 자체가 필요 없음 (같은 monotonic clock), ③ 빌드 → 실행 사이클이 빠름 (scp 불필요), ④ gdb/perf/csv 디버깅 도구 모두 PC 에서 풍부.
+
+### 17-2. 좌표 정합
+
+모든 데이터가 **lab frame (camera tracker의 origin tag frame)**에서 일관되게 표현됨:
+- 카메라가 보내는 torso/box pose: lab frame ✓
+- npz의 ref pose: 반드시 `align_npz_to_lab.py`로 변환된 v2 NPZ 사용
+  - 즉 `motion_file: .../sub8_45_extended_coords_processed_v2.npz`
+- 정책의 출력 (action)은 motor command 그대로
+
+> **주의**: 일반 `sub8_45` 정책은 raw npz (`_extended.npz`)로 동작, tag_history 정책은 aligned npz (`_extended_coords_processed_v2.npz`)로 동작. config.yaml 의 motion_file 차이로 자동 분기됨.
+
+### 17-3. UDP wire format
+
+ASCII 한 줄 (`\n` 종결, 약 150 bytes):
+
+```
+<ts_ns> <torso_v> <tx> <ty> <tz> <tqw> <tqx> <tqy> <tqz> <box_v> <bx> <by> <bz> <bqw> <bqx> <bqy> <bqz>
+```
+
+- `ts_ns` : 발신 PC의 wall clock (ns)
+- `torso_v` / `box_v` : 0/1 valid 플래그
+- pose는 lab frame, quat은 (w,x,y,z)
+
+Jetson 측이 패킷 수신 시각도 같이 저장해서 staleness 체크는 자체 monotonic clock으로 함 → **NTP 동기화 불필요**.
+
+#### Sample-and-hold + warm-up (2026-05-23 보강)
+
+초기 구현은 200ms 이상 stale 시 obs를 zero/identity로 떨어뜨렸음. 이건 위험: (a) R1+Y 직후 첫 패킷 도착 전 50–200ms 동안 정책이 zero obs로 step → 발산, (b) 한 프레임만 detection이 빠져도 obs가 origin으로 점프해서 `motion_anchor_pos_b` 가 폭발. 두 단계 보강:
+
+1. **Sample-and-hold cache**: `latest_camera_poses()` 가 "마지막 valid snapshot" 을 영구 보관. UDP 드롭/AprilTag 한 프레임 dropout 가 일어나도 가장 최근 *valid* 값을 그대로 유지. 200ms 초과 시 throttled `spdlog::warn` ("stale pose age=...ms"), 2s 초과 시 `spdlog::error` ("HARD STALE — publisher likely dead"). 단, 값을 zero로 떨어뜨리진 않음 (그게 더 위험).
+2. **`enter()` warm-up**: FSM 진입 시 `camera_pose_sub.wait_for_first_packet(1500ms)` 로 첫 패킷 도착까지 블로킹. 도착하면 `[cam] warm-up ok` 로그, 타임아웃이면 `[cam] warm-up TIMEOUT` 경고 → 트래커가 안 켜져 있다는 신호. 즉 **R1+Y 누르기 전에 PC `track_robot_and_box_multicam.py --udp-publish` 가 켜져 있어야 함** (그래야 첫 step에 valid obs).
+
+### 17-4. 빌드 절차 (PC-only 모드)
+
+```bash
+# (PC) 빌드
+cd ~/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/build
+cmake --build .       # State_Mimic.cpp + camera_pose_subscriber.h 컴파일됨
+
+# (PC) extended npz 를 lab frame 으로 정렬 (각 실험 시작 자세에 맞춰 매번 새로 하길 권장)
+cd ~/realsense_calib
+python align_npz_to_lab.py \
+  --obs-csv outputs/<start_pose_csv>.csv \
+  --ref-npz unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45_tag_history/params/sub8_largebox_045_original_extended.npz \
+  --out-npz outputs/sub8_45_extended_coords_processed_v2.npz
+
+# (선택) MuJoCo 로 정합 결과 시각 검증
+python visualize_aligned_npz_mujoco.py \
+  --npz outputs/sub8_45_extended_coords_processed_v2.npz --frame sim
+```
+
+빌드 산출물 위치:
+- PC 바이너리: `~/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/build/g1_ctrl`
+- aligned npz: `~/realsense_calib/outputs/sub8_45_extended_coords_processed_v2.npz`
+  (deploy 측 motion_file 경로는 `config.yaml` 의 `Mimic_Sub8_45_TagHistory` 항목 참고)
+
+> **Split-machine (Jetson) 모드**: §7-A / §7-B 참고. PC-only 모드와 같은 코드/헤더가 그대로 쓰이고, 차이는 (a) Jetson 에 한번 빌드해두기, (b) PC 트래커에서 `--udp-host 192.168.123.164` 로 명시.
+
+### 17-5. 실행 시퀀스 (PC-only, 권장)
+
+```bash
+# 터미널 1 — 트래커 시작 + UDP loopback 송신
+cd ~/realsense_calib
+python track_robot_and_box_multicam.py \
+  --cam1-serial 935322072654 --cam2-serial 115222071236 --cam3-serial 112322072671 \
+  --cam1-calib camera1_935322072654_calibration.npz \
+  --cam2-calib camera2_115222071236_calibration.npz \
+  --cam3-calib camera3_112322072671_calibration.npz \
+  --origin-id 1 --anchor-ids 10 --margin-min 20 \
+  --detector-quad-decimate 1.5 --no-show-cam-windows \
+  --udp-publish \
+  --csv-out outputs/sub8_45_taghist.csv --print-every 30
+# (--udp-host default 가 127.0.0.1 이므로 별도 지정 불필요)
+```
+
+```bash
+# 터미널 2 — g1_ctrl 시작 (PC 에서 직접)
+cd ~/realsense_calib/unitree_rl_mjlab/deploy/robots/g1
+./build/g1_ctrl --network <PC_NIC> --log
+# 또는 NIC 자동탐지: ./build/g1_ctrl --log
+# PC NIC 확인: ip -br a | grep "192\.168\.123"   (예: enp0s31f6, eno1)
+```
+
+콘솔 시퀀스:
+1. 터미널 1: `[multicam] UDP publish -> 127.0.0.1:9999`
+2. 터미널 2: g1_ctrl 시작 → 컨트롤러로 `L2+R2` (debug 진입) → `L2+up` (FixStand) → `R2+A` (Velocity)
+3. **Velocity 상태에서 `R1+Y`** 누르면 `Mimic_Sub8_45_TagHistory` 진입
+4. 터미널 2 에 다음 두 줄이 보여야 정상:
+   - `[cam] warm-up ok: first packet received (recv_count=...)`
+   - `Loaded motion file 'sub8_45_extended_coords_processed_v2'`
+5. **만약 `[cam] warm-up TIMEOUT` 이 보이면** 즉시 `R2` (Damping) → 트래커 잘 떠있는지 + UDP loopback 도착하는지 확인 (`sudo tcpdump -i lo -A udp port 9999 -c 5`)
+
+### 17-6. 디버그 / 문제 해결
+
+| 증상 | 원인 / 해결 |
+|---|---|
+| `Observation term 'motion_anchor_pos_b' is not registered` | 빌드 누락. `cd .../g1/build && cmake --build .` 다시. |
+| `[cam] warm-up TIMEOUT after 1500ms` | 트래커가 안 떠있거나 UDP 가 도착 못 함. 터미널 1 의 `UDP publish ->` 로그 + `tcpdump -i lo udp port 9999` 로 확인. |
+| `[cam] stale pose age=...ms` 반복 | 첫 패킷은 들어왔지만 그 후 지연/드롭. 보통 카메라 detection 실패 (low-light, occlusion). 트래커 콘솔의 `head_visible/torso_visible` % 확인. **sample-and-hold 가 last-good 값을 유지하므로 obs 가 zero 로 떨어지진 않음** — 단기 dropout 은 안전. |
+| `[cam] HARD STALE age=>2000ms` | 트래커 죽었거나 publisher 멈춤. 즉시 `R2` 로 정책 종료, 트래커 재시작. |
+| 정책 시작 직후 흔들리거나 발산 | (a) npz 가 raw `_extended.npz` 일 가능성 — `config.yaml` `motion_file` 이 `_processed_v2.npz` 가리키는지 확인. (b) 시작 자세가 npz 정합 자세와 너무 멀면 `motion_anchor_pos_b` 가 큼 → 새 시작 자세로 재정합. |
+| `recv_count=0` 인 채로 진행 | 포트/host mismatch. 트래커 `--udp-host`/`--udp-port` ↔ deploy `CAMERA_POSE_BIND_ADDR`/`CAMERA_POSE_PORT` env 일치 확인. |
+| obs는 정상 같은데 로봇이 가만히 있음 | FSM 진입 안 됨. 컨트롤러 EM 풀려있는지(L2+R2 후), Velocity 상태 거쳤는지 점검. |
+
+env 로 포트/bind 변경:
+```bash
+export CAMERA_POSE_PORT=9888           # default 9999
+export CAMERA_POSE_BIND_ADDR=0.0.0.0   # default 0.0.0.0 (loopback 도 받음)
+./build/g1_ctrl --log
+```
+
+### 17-7. 검증
+
+트래커 종료 시 `[multicam] UDP packets sent: <N>`, g1_ctrl 종료 시 `[cam]` 로그의 `recv_count`. 두 값이 비슷하면 손실 거의 없음. PC-only 모드에선 1:1 가까이 나와야 정상 (loopback).
+
+UDP 도착 단독 확인:
+```bash
+# 터미널 1 (트래커는 끄고)
+sudo tcpdump -i lo -A udp port 9999 -c 5
+# 터미널 2 에서 트래커 띄우면 packet stream 이 보여야 함
+```
 

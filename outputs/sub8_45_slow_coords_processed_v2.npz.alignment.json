@@ -1,0 +1,100 @@
+{
+  "obs_csv": "/home/roy/realsense_calib/outputs/test_actor_obs_20260523_152217.csv",
+  "ref_npz": "/home/roy/realsense_calib/unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45/params/sub8_largebox_045_original_extended_slow.npz",
+  "out_npz": "/home/roy/realsense_calib/outputs/sub8_45_slow_coords_processed_v2.npz",
+  "align_mode": "yaw-only (delta_yaw=+8.12\u00b0, yaw_npz=+85.53\u00b0, yaw_csv=+93.65\u00b0)",
+  "torso_forward_axis": "+x",
+  "ref_frame": 0,
+  "anchor_body_idx": 16,
+  "num_csv_torso_frames_used": 12,
+  "num_csv_obj_frames_used": 12,
+  "transformed_keys": [
+    "body_pos_w",
+    "body_quat_w",
+    "body_lin_vel_w",
+    "body_ang_vel_w",
+    "object_pos_w",
+    "object_quat_w",
+    "object_lin_vel_w",
+    "object_ang_vel_w"
+  ],
+  "T_lab_world": [
+    [
+      0.9899782676381378,
+      0.14121979182887825,
+      0.0,
+      0.6434283403011807
+    ],
+    [
+      0.14121979182887825,
+      -0.9899782676381378,
+      0.0,
+      1.4950671532798672
+    ],
+    [
+      0.0,
+      0.0,
+      -1.0,
+      0.03649041103679518
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "R_lab_world": [
+    [
+      0.9899782676381378,
+      0.14121979182887825,
+      0.0
+    ],
+    [
+      0.14121979182887825,
+      -0.9899782676381378,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      -1.0
+    ]
+  ],
+  "t_lab_world": [
+    0.6434283403011807,
+    1.4950671532798672,
+    0.03649041103679518
+  ],
+  "q_lab_world_wxyz": [
+    0.0,
+    0.9974914204237894,
+    0.0707874719207511,
+    0.0
+  ],
+  "csv_mean_torso_pos": [
+    -0.2947884523271326,
+    0.8026160917195934,
+    -1.0231714541975798
+  ],
+  "csv_mean_obj_pos": [
+    0.10939205122238337,
+    0.9757145832858822,
+    -0.198146416694413
+  ],
+  "npz_anchor_torso_pos_orig": [
+    -1.026602029800415,
+    0.553016722202301,
+    1.059661865234375
+  ],
+  "npz_anchor_obj_pos_orig": [
+    -1.1993372440338135,
+    0.31650635600090027,
+    0.18340031802654266
+  ],
+  "post_align_torso_pos_err_mm": 1.1102230246251565e-13,
+  "post_align_torso_R_err_deg": 154.8492885963944,
+  "post_align_obj_pos_err_mm": 611.8361039482288,
+  "post_align_obj_R_err_deg": 111.30758610075813,
+  "generated_at": "2026-05-23T16:24:15"
+}

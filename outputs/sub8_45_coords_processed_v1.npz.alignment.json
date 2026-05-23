@@ -1,0 +1,98 @@
+{
+  "obs_csv": "/home/roy/realsense_calib/outputs/test_actor_obs_20260523_152217.csv",
+  "ref_npz": "/home/roy/realsense_calib/humanoid_project/src/assets/OmniRetarget/processed/sub8_largebox_045_original.npz",
+  "out_npz": "/home/roy/realsense_calib/outputs/sub8_45_coords_processed_v1.npz",
+  "ref_frame": 0,
+  "anchor_body_idx": 16,
+  "num_csv_torso_frames_used": 12,
+  "num_csv_obj_frames_used": 12,
+  "transformed_keys": [
+    "body_pos_w",
+    "body_quat_w",
+    "body_lin_vel_w",
+    "body_ang_vel_w",
+    "object_pos_w",
+    "object_quat_w",
+    "object_lin_vel_w",
+    "object_ang_vel_w"
+  ],
+  "T_lab_world": [
+    [
+      -0.9123011761778741,
+      0.2778271511368477,
+      -0.3008628259989974,
+      -1.0661888886633641
+    ],
+    [
+      -0.011623694680392536,
+      -0.751943760099102,
+      -0.6591246518436277,
+      1.9049699146519772
+    ],
+    [
+      -0.4093547049629673,
+      -0.5978231463337503,
+      0.6892286754942292,
+      -1.8431589722259873
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "R_lab_world": [
+    [
+      -0.9123011761778741,
+      0.2778271511368477,
+      -0.3008628259989974
+    ],
+    [
+      -0.011623694680392536,
+      -0.751943760099102,
+      -0.6591246518436277
+    ],
+    [
+      -0.4093547049629673,
+      -0.5978231463337503,
+      0.6892286754942292
+    ]
+  ],
+  "t_lab_world": [
+    -1.0661888886633641,
+    1.9049699146519772,
+    -1.8431589722259873
+  ],
+  "q_lab_world_wxyz": [
+    -0.07903098444066026,
+    -0.1939161396487307,
+    -0.34319409777506954,
+    0.9156246204282791
+  ],
+  "csv_mean_torso_pos": [
+    -0.2947884523271326,
+    0.8026160917195934,
+    -1.0231714541975798
+  ],
+  "csv_mean_obj_pos": [
+    0.10939205122238337,
+    0.9757145832858822,
+    -0.198146416694413
+  ],
+  "npz_anchor_torso_pos_orig": [
+    -1.026602029800415,
+    0.553016722202301,
+    1.059661865234375
+  ],
+  "npz_anchor_obj_pos_orig": [
+    -1.1993372440338135,
+    0.31650635600090027,
+    0.18340031802654266
+  ],
+  "post_align_torso_pos_err_mm": 4.002966042486721e-13,
+  "post_align_torso_R_err_deg": 0.0,
+  "post_align_obj_pos_err_mm": 1350.764177350359,
+  "post_align_obj_R_err_deg": 162.75980965516328,
+  "generated_at": "2026-05-23T15:49:28"
+}

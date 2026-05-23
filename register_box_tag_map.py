@@ -52,9 +52,14 @@ TAG_SIZE, TAG_SIZE_MAP = merge_tag_sizes(tag_default, cfg_tag_size_map, cli_tag_
 BOX_TAG_IDS = [0, 1, 2, 3, 4, 5]
 
 # Box dimensions [m]
-BOX_W = 0.37
-BOX_D = 0.32
-BOX_H = 0.29
+# User box is a 34 × 34 × 34 cm cube. (Earlier values 0.37/0.32/0.29 were
+# rough guesses and only affected: (a) the z-coordinate of tag 0 in the box
+# body frame via REF_TAG_TO_BOX_TRANSLATION below, and (b) the dims drawn
+# in the GUI bbox. The xy positions of side-face tags are still measured
+# directly from detections so they are unaffected.)
+BOX_W = 0.34
+BOX_D = 0.34
+BOX_H = 0.34
 
 # ID 0 = top face.
 # box center is H/2 "below" tag 0 in tag0 local frame.

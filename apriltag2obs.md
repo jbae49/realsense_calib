@@ -36,7 +36,7 @@
 | Tag ID | 위치 | 의미 | 고정 오프셋 |
 |---|---|---|---|
 | `9` | 머리 위 | 머리 태그 | tag → torso_link: **+25 cm in world z (=아래로 25 cm)** |
-| `8`, `7` | pelvis 살짝 아래 | pelvis 태그 | tag → root(pelvis): **-10 cm in world z (=위로 10 cm)** |
+| `8`, `7` | pelvis 살짝 아래 | pelvis 태그 | tag → root(pelvis): **-5 cm in world z (=위로 5 cm)** |
 | `0~5` | 박스 위 | 박스 태그 (이미 사용중) | `box_tag_map.npz` 기준 |
 | `1` | 바닥 | 실험실 origin (옵션) | floor anchor |
 
@@ -45,7 +45,7 @@
 - 따라서 torso position은 두 경로로 추정 가능:
   좌표 컨벤션: floor tag(예: id=1)를 `--origin-id`로 쓰면 pupil_apriltags의 Z축이
   태그 뒷면(=지면 속) 방향이라서 **+Z = 아래, −Z = 위** 가 됩니다. 모든 z 부호는 이 가정 기준.
-  - **경로 A (pelvis tag)**: `T_world_root = T_world_pelvisTag * (z = −0.10)` (위로 10cm),
+  - **경로 A (pelvis tag)**: `T_world_root = T_world_pelvisTag * (z = −0.05)` (위로 5cm),
     `T_world_torso ≈ T_world_root * (z = −0.20, ori는 root quat 기준)` (위로 20cm)
   - **경로 B (head tag)**: `T_world_torso = T_world_headTag * (z = +0.25)` (아래로 25cm)
 
