@@ -1,11 +1,1 @@
-python track_robot_and_box_multicam.py \
-  --cam1-serial 935322072654 --cam2-serial 115222071236 --cam3-serial 112322072671 \
-  --cam1-calib camera1_935322072654_calibration.npz \
-  --cam2-calib camera2_115222071236_calibration.npz \
-  --cam3-calib camera3_112322072671_calibration.npz \
-  --origin-id 1 --anchor-ids 10 --margin-min 20 \
-  --detector-quad-decimate 1.5 \
-  --no-show-cam-windows \
-  --udp-publish \
-  --csv-out outputs/sub8_45_taghist.csv --print-every 30 \
-  2>&1 | tee outputs/tracker_$(date +%Y%m%d_%H%M%S).log
+ㅏ

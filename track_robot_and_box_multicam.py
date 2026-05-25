@@ -53,6 +53,25 @@ from utils.apriltag_config import (
     merge_tag_sizes,
     detect_with_tag_sizes,
 )
+from utils.runtime_alignment import (
+    MotionLoader,
+    R_BODY_FLIP,
+    TORSO_TAG_MAP,
+    average_pose_samples,
+    build_v2_packet,
+    compute_six_obs,
+    compute_T_sim_lab,
+    compute_T_sim_lab_pelvis_yaw,
+    fuse_torso_link,
+    head_tag_to_torso_link,
+    pelvis_front_tag_to_pelvis_link,
+    pelvis_front_tag_to_torso_link,
+    quat_wxyz_to_R,
+    rotation_to_rot6d,
+    torso_back_tag_to_torso_link,
+    torso_front_tag_to_torso_link,
+    transform_pose_lab_to_sim,
+)
 
 
 # =========================================================
@@ -312,7 +331,11 @@ parser.add_argument("--anchor-ids", type=str, default="10",
 parser.add_argument("--anchor-config", type=str, default="config/floor_anchor_transforms.json",
                     help="JSON with anchor transforms: anchors[id].T_origin_anchor (4x4)")
 parser.add_argument("--head-tag-id", type=int, default=9)
-parser.add_argument("--pelvis-tag-ids", type=str, default="8,7")
+parser.add_argument("--pelvis-tag-ids", type=str, default="8",
+                    help="Comma-separated pelvis tag IDs. As of 2026-05-25 only "
+                         "tag 8 (front-mounted) is used; tag 7 is intentionally "
+                         "excluded to avoid winner-take-all yaw flips. Set to "
+                         "'8,7' to re-enable both (legacy behavior).")
 parser.add_argument("--box-tag-map", type=str, default="box_tag_map.npz")
 # Box body-frame correction: mjlab's large_box.xml defines the body frame
 # along the *mesh AABB* axes (because the mesh itself is drawn with the
@@ -404,6 +427,16 @@ parser.add_argument("--show-box-tags", action="store_true",
                     help="Show per-box-tag world position and per-tag candidates on fused panel")
 parser.add_argument("--show-robot-tags", action="store_true", default=True)
 parser.add_argument("--no-show-robot-tags", dest="show_robot_tags", action="store_false")
+parser.add_argument("--show-torso-tag-debug", action="store_true", default=False,
+                    help="If set, show per-tag SINGLE torso_link estimates "
+                         "as color-coded circles on each camera window AND "
+                         "per-tag lines on the FUSED panel. Useful for "
+                         "diagnosing mounting/offset errors. Default OFF "
+                         "for a clean view that only shows pelvis_link and "
+                         "torso_link FUSED.")
+parser.add_argument("--show-legacy-pose-lines", action="store_true", default=False,
+                    help="Show legacy head/torso/root pose lines in FUSED panel "
+                         "(default OFF; step 1 uses only pelvis tag + estimated link).")
 parser.add_argument("--show-axes", action="store_true", default=True,
                     help="Draw per-detection RGB axes on each camera image")
 parser.add_argument("--no-show-axes", dest="show_axes", action="store_false")
@@ -470,6 +503,57 @@ parser.add_argument("--udp-host", type=str, default="127.0.0.1",
                          "Use 192.168.123.164 to send to the Jetson.")
 parser.add_argument("--udp-port", type=int, default=9999,
                     help="UDP port matching CAMERA_POSE_PORT in deploy.")
+# Runtime alignment (v2 publisher, sub8_45_tag_history). When --motion-file
+# is given, the publisher OWNS the NPZ: at SPACE press it computes
+# T_sim_lab from the current real torso pose vs NPZ frame 0, then runs a
+# 50 Hz ticker that emits the v2 wire-format packet (motion_command + 6
+# tag-history obs, all in NPZ sim frame). With no --motion-file, behaviour
+# falls back to legacy v1 publishing (raw lab-frame torso/box pose).
+parser.add_argument("--motion-file", type=str, default="",
+                    help="Path to RAW (sim-frame) reference motion npz. "
+                         "Enables v2 publisher mode. The deploy-side "
+                         "Mimic_Sub8_45_TagHistory state will read all ref "
+                         "poses + the 6 actor obs from these UDP packets, "
+                         "so the C++ side does NOT load the npz itself.")
+parser.add_argument("--align-mode", type=str, default="yaw-only",
+                    choices=["yaw-only", "full-rotation"],
+                    help="T_sim_lab fit at SPACE press. yaw-only (default, "
+                         "gravity-preserving) projects forward axis onto the "
+                         "horizontal plane and matches headings. full-rotation "
+                         "matches roll/pitch too — DANGEROUS, bakes any "
+                         "start-pose tilt in as a permanent gravity error.")
+parser.add_argument("--anchor-body-idx", type=int, default=15,
+                    help="Body index used as the obs frame (motion_anchor_*, "
+                         "object_*_torso, etc.). Default 15 = torso_link in "
+                         "mjlab G1 30-body depth-first order; matches "
+                         "State_Mimic.h.")
+parser.add_argument("--align-body-idx", type=int, default=0,
+                    help="Body index used to FIT T_sim_lab at SPACE press "
+                         "(separate from --anchor-body-idx). Default 0 = "
+                         "pelvis (root). Pelvis is approximately vertical in "
+                         "both robot FixStand and NPZ frame 0, so its yaw is "
+                         "a robust alignment anchor; the torso is bent ~25 "
+                         "deg in NPZ frame 0 and would bias T if used.")
+parser.add_argument("--torso-forward-axis", type=str, default="+x",
+                    choices=["+x", "-x", "+y", "-y"],
+                    help="Robot forward direction in torso local frame "
+                         "(G1 = '+x'). Used only by torso-based align mode.")
+parser.add_argument("--pelvis-tag-fwd-axis", type=str, default="-z",
+                    choices=["+x", "-x", "+y", "-y", "+z", "-z"],
+                    help="Which pelvis-tag-LOCAL axis points toward the "
+                         "robot's chest (= body forward). For a back-mounted "
+                         "G1 pelvis tag (default --pelvis-tag-up-axis=-y), "
+                         "body fwd = -z_tag. If alignment yaw is off by 180, "
+                         "try '+z' instead.")
+parser.add_argument("--align-window-sec", type=float, default=3.0,
+                    help="Length of the SPACE-press averaging window in "
+                         "seconds. Pelvis pose samples within this window "
+                         "are averaged (position + quaternion mean) before "
+                         "T_sim_lab is fit.")
+parser.add_argument("--ref-fps", type=float, default=50.0,
+                    help="Reference clock rate in Hz. v2 packets are sent at "
+                         "this rate from a thread independent of the camera "
+                         "loop. Must match the policy's step_dt (50 Hz = 0.02s).")
 args = parser.parse_args()
 
 
@@ -638,6 +722,20 @@ CSV_COLUMNS = [
     "pelvis_visible", "pelvis_used_id",
     "pelvis_pos_x", "pelvis_pos_y", "pelvis_pos_z",
     "pelvis_quat_w", "pelvis_quat_x", "pelvis_quat_y", "pelvis_quat_z", "pelvis_n_cams",
+    # Step 1: pelvis link (root body) estimated from pelvis FRONT tag id 8
+    # via hardcoded R_tag_to_body + offset (utils.runtime_alignment).
+    "pelvis_link_pos_x", "pelvis_link_pos_y", "pelvis_link_pos_z",
+    "pelvis_link_quat_w", "pelvis_link_quat_x", "pelvis_link_quat_y", "pelvis_link_quat_z",
+    # Step 3: torso_link estimated from multi-tag fusion of head(9) + torso back(12)
+    # + torso front(13). n_tags = number of tags actually contributing this frame
+    # (0..3). tags_used = sorted CSV string ("9", "9|12", "9|12|13", ...).
+    # Per-tag residual = how far each candidate sits from the fused result
+    # (lower is better; large gap = mounting calibration may be off or one tag
+    # has a bad detection).
+    "torso_link_n_tags", "torso_link_tags_used",
+    "torso_link_pos_x", "torso_link_pos_y", "torso_link_pos_z",
+    "torso_link_quat_w", "torso_link_quat_x", "torso_link_quat_y", "torso_link_quat_z",
+    "torso_link_residual_max_pos_m", "torso_link_residual_max_rot_deg",
     "root_pos_x", "root_pos_y", "root_pos_z",
     "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
     "torso_head_pos_x", "torso_head_pos_y", "torso_head_pos_z",
@@ -687,10 +785,19 @@ if args.csv_out:
     print(f"[multicam] CSV logging -> {csv_path_resolved}")
 
 
-# UDP publisher (for deploy-side camera_pose_subscriber). One ASCII line per
-# loop. Format matches the sscanf in camera_pose_subscriber.h:
-#   "<ts_ns> <torso_v> <tx> <ty> <tz> <tqw> <tqx> <tqy> <tqz>
-#    <box_v>   <bx> <by> <bz> <bqw> <bqx> <bqy> <bqz>\n"
+# UDP publisher (for deploy-side camera_pose_subscriber).
+#
+# Two wire formats:
+#   v1 (legacy, --motion-file empty): one ASCII line per camera-loop iteration
+#       "<ts_ns> <torso_v> <tx> <ty> <tz> <tqw> <tqx> <tqy> <tqz>
+#        <box_v>   <bx> <by> <bz> <bqw> <bqx> <bqy> <bqz>\n"
+#       Used by motion-only Mimic_Sub8_45 / Mimic_Dance1_subject2 deploy paths
+#       (their C++ ignores the camera packets but the warm-up still works).
+#
+#   v2 (--motion-file given): one ASCII line per --ref-fps tick, emitted from
+#       the ref ticker thread. Carries motion_command + the 6 tag-history
+#       actor obs in sim frame, plus phase / frame_idx metadata. Used by
+#       Mimic_Sub8_45_TagHistory.
 udp_sock = None
 udp_target = None
 udp_packet_count = 0
@@ -698,6 +805,343 @@ if args.udp_publish:
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_target = (args.udp_host, args.udp_port)
     print(f"[multicam] UDP publish -> {args.udp_host}:{args.udp_port}")
+
+# -------------------------------------------------------------------------
+# v2 publisher setup: NPZ + ref ticker thread + IDLE/PLAYBACK phase state
+# -------------------------------------------------------------------------
+v2_mode = bool(args.motion_file.strip())
+motion_loader = None
+ref_ticker_thread = None
+ref_ticker_running = False
+v2_packet_count = 0
+
+# Thread-safe latch for the most recent VALID camera-derived torso/box pose
+# in the lab frame. Updated by the main camera loop after fusion, read by
+# the 50 Hz ref ticker. The ticker uses sample-and-hold: if a frame's torso
+# is missing (e.g., head tag occluded) the previous valid pose stays in
+# place rather than dropping to identity / zero — same idea as the C++
+# subscriber's `last_torso_lab` cache.
+cam_latch = {
+    "torso_pos":   np.zeros(3, dtype=float),
+    "torso_R":     np.eye(3, dtype=float),    # head-tag z-down body conv
+    "torso_valid": False,
+    "box_pos":   np.zeros(3, dtype=float),
+    "box_R":     np.eye(3, dtype=float),      # mjlab z-up body conv (post-OBB)
+    "box_valid": False,
+    "pelvis_pos":   np.zeros(3, dtype=float),
+    "pelvis_R":     np.eye(3, dtype=float),   # pelvis-tag local body conv
+    "pelvis_valid": False,
+    "stamp_ns":  0,
+}
+cam_latch_lock = threading.Lock()
+
+# Phase state machine. Three states:
+#   IDLE       : pre-SPACE. Publisher emits NPZ frame-0 obs with real==ref
+#                ("perfect tracking"); robot stays in FixStand, no motion.
+#   AVERAGING  : SPACE pressed. Publisher continues emitting IDLE-style obs
+#                while a pelvis-pose buffer accumulates samples for
+#                args.align_window_sec seconds. At end of window, T_sim_lab
+#                is fit from averaged pelvis vs NPZ frame-0 pelvis, then
+#                we auto-transition to PLAYBACK.
+#   PLAYBACK   : T committed. Frame_idx counts up at ref_fps from
+#                t_play_start; real torso/box from the cam latch are
+#                transformed via T to sim frame and 6 actor obs are
+#                computed and emitted.
+# Pressing SPACE in PLAYBACK returns to IDLE (drops T, resets ref clock).
+phase_state = {
+    "phase":         "IDLE",
+    "T_sim_lab":     None,     # 4x4 numpy array, set when entering PLAYBACK
+    "t_play_start":  0.0,      # monotonic seconds at PLAYBACK start
+    "t_avg_start":   0.0,      # monotonic seconds at SPACE press (AVERAGING entry)
+    "avg_pos_buf":   [],       # list of (3,) pelvis position samples
+    "avg_R_buf":     [],       # list of (3,3) pelvis rotation samples
+    "align_diag":    None,     # diagnostic dict from compute_T_sim_lab*
+}
+phase_lock = threading.Lock()
+
+if v2_mode:
+    motion_loader = MotionLoader(
+        args.motion_file,
+        anchor_body_idx=int(args.anchor_body_idx),
+        align_body_idx=int(args.align_body_idx),
+        fps=float(args.ref_fps),
+    )
+    print(f"[multicam-v2] loaded motion: {motion_loader.path}")
+    print(f"[multicam-v2]   num_frames={motion_loader.num_frames}  "
+          f"duration={motion_loader.num_frames * motion_loader.dt:.3f}s  "
+          f"dof={motion_loader.dof}  has_object={motion_loader.has_object}")
+    print(f"[multicam-v2]   anchor_body_idx={motion_loader.anchor_body_idx} (obs frame)  "
+          f"align_body_idx={motion_loader.align_body_idx} (T fit anchor)")
+    print(f"[multicam-v2]   align: pelvis-yaw-only over "
+          f"{args.align_window_sec:.1f}s window  "
+          f"pelvis_tag_fwd_axis='{args.pelvis_tag_fwd_axis}'  "
+          f"ref_fwd='{args.torso_forward_axis}'")
+    if not args.udp_publish:
+        print("[multicam-v2] WARNING --motion-file set but --udp-publish is off; "
+              "v2 packets will NOT be sent.")
+    if motion_loader.has_object:
+        ref0 = motion_loader.at(0)
+        print(f"[multicam-v2]   frame-0 torso(sim)={ref0.torso_pos}  "
+              f"object(sim)={ref0.object_pos}")
+
+
+def _latch_update(world_T_torso, world_T_box, world_T_pelvis, stamp_ns):
+    """Copy current frame's fused poses into cam_latch under lock.
+    Only overwrites a slot if the new measurement is non-None (sample-and-hold)."""
+    if not v2_mode:
+        return
+    with cam_latch_lock:
+        cam_latch["stamp_ns"] = int(stamp_ns)
+        if world_T_torso is not None:
+            cam_latch["torso_pos"] = world_T_torso[:3, 3].astype(float).copy()
+            cam_latch["torso_R"]   = world_T_torso[:3, :3].astype(float).copy()
+            cam_latch["torso_valid"] = True
+        if world_T_box is not None:
+            cam_latch["box_pos"] = world_T_box[:3, 3].astype(float).copy()
+            cam_latch["box_R"]   = world_T_box[:3, :3].astype(float).copy()
+            cam_latch["box_valid"] = True
+        if world_T_pelvis is not None:
+            cam_latch["pelvis_pos"] = world_T_pelvis[:3, 3].astype(float).copy()
+            cam_latch["pelvis_R"]   = world_T_pelvis[:3, :3].astype(float).copy()
+            cam_latch["pelvis_valid"] = True
+
+
+def _try_start_averaging():
+    """SPACE press in IDLE: gate-check that the pelvis tag is currently
+    visible, then transition to AVERAGING (the ref ticker takes care of
+    sampling from there). Returns (ok, message)."""
+    if motion_loader is None:
+        return False, "no motion loaded"
+    with cam_latch_lock:
+        if not cam_latch["pelvis_valid"]:
+            return False, ("no valid pelvis latch yet — make sure at least "
+                           "one camera is seeing a pelvis tag")
+    with phase_lock:
+        phase_state["phase"] = "AVERAGING"
+        phase_state["t_avg_start"] = time.monotonic()
+        phase_state["avg_pos_buf"] = []
+        phase_state["avg_R_buf"]   = []
+        phase_state["T_sim_lab"]   = None
+        phase_state["align_diag"]  = None
+    return True, (f"AVERAGING started, will collect pelvis poses for "
+                  f"{args.align_window_sec:.1f}s, then auto-PLAYBACK.")
+
+
+def _finish_averaging_and_start_playback():
+    """Called from the ref ticker when the AVERAGING window elapses.
+    Computes T_sim_lab from the averaged pelvis pose vs NPZ frame-0 pelvis,
+    transitions to PLAYBACK. Caller must hold no locks."""
+    if motion_loader is None:
+        return
+    with phase_lock:
+        if phase_state["phase"] != "AVERAGING":
+            return
+        pos_samples = list(phase_state["avg_pos_buf"])
+        R_samples   = list(phase_state["avg_R_buf"])
+    if len(pos_samples) < 5:
+        # Not enough samples — go back to IDLE so the operator can retry.
+        with phase_lock:
+            phase_state["phase"] = "IDLE"
+            phase_state["t_avg_start"] = 0.0
+            phase_state["avg_pos_buf"] = []
+            phase_state["avg_R_buf"]   = []
+        print(f"[multicam-v2] AVERAGING aborted: only {len(pos_samples)} "
+              f"pelvis samples collected (pelvis tag occluded?). Back to IDLE.")
+        return
+    try:
+        pelvis_pos_avg, pelvis_R_avg = average_pose_samples(pos_samples, R_samples)
+    except Exception as e:
+        with phase_lock:
+            phase_state["phase"] = "IDLE"
+            phase_state["t_avg_start"] = 0.0
+            phase_state["avg_pos_buf"] = []
+            phase_state["avg_R_buf"]   = []
+        print(f"[multicam-v2] AVERAGING aborted: averaging failed ({e}). Back to IDLE.")
+        return
+
+    ref0 = motion_loader.at(0)
+    T_sim_lab, diag = compute_T_sim_lab_pelvis_yaw(
+        pelvis_pos_avg, pelvis_R_avg,
+        ref0.align_pos, ref0.align_R,
+        real_fwd_axis_tag_local=args.pelvis_tag_fwd_axis,
+        ref_fwd_axis_body_local=args.torso_forward_axis,
+    )
+    diag["n_samples"] = len(pos_samples)
+    diag["window_sec"] = float(args.align_window_sec)
+    with phase_lock:
+        phase_state["phase"] = "PLAYBACK"
+        phase_state["T_sim_lab"] = T_sim_lab
+        phase_state["t_play_start"] = time.monotonic()
+        phase_state["t_avg_start"] = 0.0
+        phase_state["avg_pos_buf"] = []
+        phase_state["avg_R_buf"]   = []
+        phase_state["align_diag"]  = diag
+    print(f"[multicam-v2] PLAYBACK started, mode={diag['mode']}, "
+          f"delta_yaw={diag['delta_yaw_deg']:+.2f}deg "
+          f"({len(pos_samples)} pelvis samples averaged)")
+    print(f"[multicam-v2]   real_pelvis_pos_lab_avg={pelvis_pos_avg}")
+    print(f"[multicam-v2]   ref0_pelvis_pos_sim    ={ref0.align_pos}")
+
+
+def _back_to_idle():
+    """Hard reset to IDLE. Called by SPACE press in PLAYBACK or AVERAGING."""
+    with phase_lock:
+        phase_state["phase"] = "IDLE"
+        phase_state["T_sim_lab"] = None
+        phase_state["t_play_start"] = 0.0
+        phase_state["t_avg_start"] = 0.0
+        phase_state["avg_pos_buf"] = []
+        phase_state["avg_R_buf"]   = []
+        phase_state["align_diag"] = None
+
+
+def _compute_v2_obs(snapshot_phase, snapshot_T, snapshot_t_start, snapshot_cam):
+    """Build the (frame_idx, motion_command, 6 obs) tuple for one v2 packet.
+
+    snapshot_phase   : "IDLE" or "PLAYBACK"
+    snapshot_T       : 4x4 T_sim_lab (or None when IDLE)
+    snapshot_t_start : monotonic seconds at PLAYBACK start (unused in IDLE)
+    snapshot_cam     : copy of cam_latch slots (taken under lock)
+
+    IDLE behaviour: pretend real == ref at frame 0 (perfect tracking). This
+    makes motion_anchor_*_b zero/identity and the box-related obs match the
+    npz-implied values, so the policy outputs frame-0 joint targets and the
+    robot just stands.
+
+    PLAYBACK behaviour: advance frame at exactly 1/ref_fps per tick from
+    t_play_start; transform the latest cam latch (sample-and-hold) into sim
+    frame via T_sim_lab and the body-frame flip on the torso.
+    """
+    if snapshot_phase in ("IDLE", "AVERAGING"):
+        # Both pre-SPACE and during SPACE-averaging: real := ref at frame 0.
+        # Policy gets "perfect tracking" obs and motion_command for frame 0,
+        # so the robot doesn't move until PLAYBACK kicks in.
+        frame_idx = 0
+        ref = motion_loader.at(0)
+        real_torso_pos = ref.torso_pos
+        real_torso_R   = ref.torso_R
+        real_box_pos   = ref.object_pos
+        real_box_R     = ref.object_R
+    else:  # PLAYBACK
+        elapsed = time.monotonic() - snapshot_t_start
+        frame_idx = int(round(elapsed / motion_loader.dt))
+        frame_idx = max(0, min(frame_idx, motion_loader.num_frames - 1))
+        ref = motion_loader.at(frame_idx)
+
+        # Torso: body conv flip + lab→sim. If the latch isn't valid yet,
+        # hold real == ref so we don't emit garbage on the first tick.
+        if snapshot_cam["torso_valid"]:
+            real_torso_pos, real_torso_R = transform_pose_lab_to_sim(
+                snapshot_T, snapshot_cam["torso_pos"], snapshot_cam["torso_R"],
+                body_flip=True,
+            )
+        else:
+            real_torso_pos = ref.torso_pos
+            real_torso_R   = ref.torso_R
+
+        # Box: NO body flip (tracker already emits in mjlab AABB body conv).
+        if snapshot_cam["box_valid"]:
+            real_box_pos, real_box_R = transform_pose_lab_to_sim(
+                snapshot_T, snapshot_cam["box_pos"], snapshot_cam["box_R"],
+                body_flip=False,
+            )
+        else:
+            real_box_pos = ref.object_pos
+            real_box_R   = ref.object_R
+
+    obs = compute_six_obs(
+        real_torso_pos, real_torso_R, real_box_pos, real_box_R,
+        ref.torso_pos, ref.torso_R, ref.object_pos, ref.object_R,
+    )
+    return frame_idx, ref.joint_pos, ref.joint_vel, obs
+
+
+def _ref_ticker_loop():
+    """50 Hz ref clock. Decoupled from the camera loop (which may run 5-15
+    Hz on 3 cams). Each tick we:
+      * sample-and-hold the latest valid cam pose,
+      * if AVERAGING, append the latest pelvis pose to the running buffer
+        (so we end up with ~50 samples per second in the avg window),
+      * if AVERAGING window has elapsed, fit T and transition to PLAYBACK,
+      * compute the obs corresponding to the current phase,
+      * send a v2 packet."""
+    global v2_packet_count
+    if motion_loader is None:
+        return
+    target_dt = motion_loader.dt
+    next_t = time.monotonic()
+    while ref_ticker_running:
+        with phase_lock:
+            snap_phase = phase_state["phase"]
+            snap_T = (phase_state["T_sim_lab"].copy()
+                      if phase_state["T_sim_lab"] is not None else None)
+            snap_t_start = phase_state["t_play_start"]
+            snap_t_avg_start = phase_state["t_avg_start"]
+        with cam_latch_lock:
+            snap_cam = {
+                "torso_pos":    cam_latch["torso_pos"].copy(),
+                "torso_R":      cam_latch["torso_R"].copy(),
+                "torso_valid":  cam_latch["torso_valid"],
+                "box_pos":      cam_latch["box_pos"].copy(),
+                "box_R":        cam_latch["box_R"].copy(),
+                "box_valid":    cam_latch["box_valid"],
+                "pelvis_pos":   cam_latch["pelvis_pos"].copy(),
+                "pelvis_R":     cam_latch["pelvis_R"].copy(),
+                "pelvis_valid": cam_latch["pelvis_valid"],
+            }
+
+        # AVERAGING phase: collect pelvis samples and check window expiry.
+        if snap_phase == "AVERAGING":
+            if snap_cam["pelvis_valid"]:
+                with phase_lock:
+                    if phase_state["phase"] == "AVERAGING":
+                        phase_state["avg_pos_buf"].append(snap_cam["pelvis_pos"])
+                        phase_state["avg_R_buf"].append(snap_cam["pelvis_R"])
+            if (time.monotonic() - snap_t_avg_start) >= float(args.align_window_sec):
+                _finish_averaging_and_start_playback()
+                # Re-snapshot phase + T for this same tick (now PLAYBACK).
+                with phase_lock:
+                    snap_phase   = phase_state["phase"]
+                    snap_T       = (phase_state["T_sim_lab"].copy()
+                                    if phase_state["T_sim_lab"] is not None else None)
+                    snap_t_start = phase_state["t_play_start"]
+
+        try:
+            frame_idx, jp, jv, obs = _compute_v2_obs(
+                snap_phase, snap_T, snap_t_start, snap_cam
+            )
+            packet = build_v2_packet(
+                ts_ns=time.time_ns(),
+                # Wire phase: IDLE/AVERAGING both map to 0 (C++ should hold
+                # episode_length at 0 during averaging too — robot stays in
+                # FixStand). Only PLAYBACK = 1.
+                phase=(1 if snap_phase == "PLAYBACK" else 0),
+                frame_idx=int(frame_idx),
+                num_frames=int(motion_loader.num_frames),
+                dof=int(motion_loader.dof),
+                joint_pos=jp,
+                joint_vel=jv,
+                obs=obs,
+            )
+            if udp_sock is not None:
+                try:
+                    udp_sock.sendto(packet, udp_target)
+                    v2_packet_count += 1
+                except OSError as e:
+                    if v2_packet_count % 1000 == 0:
+                        print(f"[multicam-v2] UDP send failed: {e}")
+        except Exception as e:
+            # Keep the ticker alive across transient errors — better to lag a
+            # tick than crash the whole publisher mid-deploy.
+            print(f"[multicam-v2] tick failed: {e}")
+
+        next_t += target_dt
+        sleep_for = next_t - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:
+            # Behind schedule; skip the lag.
+            next_t = time.monotonic()
 
 
 def udp_publish_pose(world_T_torso, world_T_box):
@@ -899,6 +1343,20 @@ detect_executor = (
     if args.detect_parallel else None
 )
 
+# v2 ref ticker thread: independent 50 Hz clock for ref-motion advance and
+# UDP send. Started here so it sees the v1 loopback path closed (we want
+# v2 to be the only outbound publisher when --motion-file is set).
+if v2_mode and args.udp_publish:
+    ref_ticker_running = True
+    ref_ticker_thread = threading.Thread(
+        target=_ref_ticker_loop,
+        name="ref_ticker",
+        daemon=True,
+    )
+    ref_ticker_thread.start()
+    print(f"[multicam-v2] ref ticker thread started @ {args.ref_fps} Hz "
+          f"(IDLE; press SPACE in any cv window to enter PLAYBACK).")
+
 try:
     while True:
         frame_idx += 1
@@ -1093,6 +1551,43 @@ try:
             world_T_pelvis = rel_fused[best_id]
             pelvis_n_cams = rel_n_cams.get(best_id, 0)
 
+        # ---- Step 1 visualization: pelvis link pose from FRONT pelvis tag (id 8) ----
+        # Hardcoded transform (see utils.runtime_alignment.PELVIS_FRONT_TAG_TO_BODY).
+        # Tag 8 is mounted flat on the front of the pelvis; the resulting link
+        # frame is overlaid on each camera GUI for empirical tuning. tag 7 is
+        # intentionally ignored here per user 2026-05-25.
+        world_T_pelvis_link = None
+        pelvis_tag8 = rel_fused.get(8)
+        if pelvis_tag8 is not None:
+            world_T_pelvis_link = pelvis_front_tag_to_pelvis_link(pelvis_tag8)
+
+        # ---- Step 3 visualization: torso_link pose from multi-tag fusion ----
+        # Combine head(9) + torso back(12) + torso front(13) via hardcoded
+        # per-tag mounting transforms + weighted quaternion average.
+        # See utils.runtime_alignment.fuse_torso_link / TORSO_TAG_MAP.
+        torso_tag_poses = {
+            tid: rel_fused.get(tid)
+            for tid in TORSO_TAG_MAP.keys()
+            if rel_fused.get(tid) is not None
+        }
+        world_T_torso_link, torso_link_diag = fuse_torso_link(
+            torso_tag_poses,
+            pelvis_tag_pose=pelvis_tag8,
+            include_pelvis_fk=True,
+        )
+
+        # Per-tag single estimates (for visual debugging / mounting validation).
+        # All five should agree at FixStand if mounting + offsets are correct.
+        head9_T_torso = (head_tag_to_torso_link(rel_fused[9])
+                         if rel_fused.get(9) is not None else None)
+        back12_T_torso = (torso_back_tag_to_torso_link(rel_fused[12])
+                          if rel_fused.get(12) is not None else None)
+        front13_T_torso = (torso_front_tag_to_torso_link(rel_fused[13])
+                           if rel_fused.get(13) is not None else None)
+        # Cross-check from pelvis: only valid at zero-waist (FixStand).
+        pelvis8_T_torso = (pelvis_front_tag_to_torso_link(pelvis_tag8)
+                           if pelvis_tag8 is not None else None)
+
         # head -> torso_head
         world_T_torso_head = None
         if world_T_headtag is not None:
@@ -1204,9 +1699,14 @@ try:
         stage_acc["fuse"] += time.time() - _t_stage
 
         # ---- UDP publish (timed under "csv" stage to avoid GUI conflation) ----
-        # Sent BEFORE GUI so deploy gets the freshest pose with minimal
-        # added latency (GUI can spike to ~10ms).
-        if udp_sock is not None:
+        # In v1 (legacy) mode we send the raw lab-frame pose every camera
+        # iteration (~5-15 Hz). In v2 mode the dedicated ref ticker thread
+        # owns UDP, so here we only update the camera latch (sample-and-hold)
+        # and skip the v1 publish entirely.
+        if v2_mode:
+            _latch_update(world_T_torso, world_T_box, world_T_pelvis,
+                          time.time_ns())
+        elif udp_sock is not None:
             udp_publish_pose(world_T_torso, world_T_box)
 
         _t_stage = time.time()
@@ -1230,6 +1730,173 @@ try:
                     ostr = f"ORIGIN id{args.origin_id}: NOT SEEN"
                     ocol = (0, 0, 255)
                 cv2.putText(img, ostr, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ocol, 2)
+
+                # ---- Step 1: pelvis LINK frame overlay (hardcoded from pelvis FRONT tag id 8) ----
+                # Larger RGB triad than tag axes (0.06) so it stands out. Origin
+                # of this triad should sit at the pelvis center (~10 cm above
+                # tag 8), with +X pointing forward, +Y left, +Z up.
+                if world_T_pelvis_link is not None and name in per_cam_origin_T:
+                    T_cN_pelvisLink = per_cam_origin_T[name] @ world_T_pelvis_link
+                    draw_axes_cam(img, cam_state[name]["K"], T_cN_pelvisLink, length=0.15)
+                    # Label at origin
+                    K_cam = cam_state[name]["K"]
+                    rvec_pl, _ = cv2.Rodrigues(T_cN_pelvisLink[:3, :3])
+                    tvec_pl = T_cN_pelvisLink[:3, 3].astype(float)
+                    pts_2d, _ = cv2.projectPoints(
+                        np.float32([[0, 0, 0]]), rvec_pl, tvec_pl, K_cam, np.zeros(5))
+                    upl, vpl = pts_2d.reshape(-1, 2)[0]
+                    if np.isfinite(upl) and np.isfinite(vpl):
+                        cv2.putText(img, "pelvis (est. root)", (int(upl) + 8, int(vpl) - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+                # ---- Step 3: torso LINK frame overlay (multi-tag fusion of 9/12/13) ----
+                # Same convention as pelvis link: +X forward, +Y left, +Z up.
+                # Origin should sit at torso_link center (roughly inside the chest
+                # at the height of the pelvis-tag-Z ~4 cm above pelvis link).
+                if world_T_torso_link is not None and name in per_cam_origin_T:
+                    T_cN_torsoLink = per_cam_origin_T[name] @ world_T_torso_link
+                    draw_axes_cam(img, cam_state[name]["K"], T_cN_torsoLink, length=0.15)
+                    K_cam = cam_state[name]["K"]
+                    rvec_tl, _ = cv2.Rodrigues(T_cN_torsoLink[:3, :3])
+                    tvec_tl = T_cN_torsoLink[:3, 3].astype(float)
+                    pts_2d, _ = cv2.projectPoints(
+                        np.float32([[0, 0, 0]]), rvec_tl, tvec_tl, K_cam, np.zeros(5))
+                    utl, vtl = pts_2d.reshape(-1, 2)[0]
+                    if np.isfinite(utl) and np.isfinite(vtl):
+                        used = "|".join(str(t) for t in torso_link_diag.get("tags_used", []))
+                        cv2.putText(img, f"torso_link FUSED ({used})",
+                                    (int(utl) + 8, int(vtl) - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+                # ---- Per-tag SINGLE torso_link estimates (color-coded markers) ----
+                # Hidden by default. Enable with --show-torso-tag-debug to
+                # diagnose mounting/offset errors.
+                # MAGENTA  = tag 8 (pelvis) cross-check via FK chain — GROUND TRUTH at FixStand
+                # CYAN     = tag 9 (head) only
+                # ORANGE   = tag 12 (torso back) only
+                # GREEN    = tag 13 (torso front) only
+                if args.show_torso_tag_debug and name in per_cam_origin_T:
+                    single_estimates = [
+                        (pelvis8_T_torso,  (255,   0, 255), "torso(id8 FK)   <- REF"),
+                        (head9_T_torso,    (255, 255,   0), "torso(id9 only)"),
+                        (back12_T_torso,   (  0, 165, 255), "torso(id12 only)"),
+                        (front13_T_torso,  (  0, 255,   0), "torso(id13 only)"),
+                    ]
+                    K_cam = cam_state[name]["K"]
+                    T_cN_origin = per_cam_origin_T[name]
+                    rvec_c, _ = cv2.Rodrigues(T_cN_origin[:3, :3])
+                    tvec_c = T_cN_origin[:3, 3].astype(float)
+                    for T_w_est, col, lbl in single_estimates:
+                        if T_w_est is None:
+                            continue
+                        pt_w = T_w_est[:3, 3].astype(float).reshape(1, 1, 3)
+                        pts2d, _ = cv2.projectPoints(pt_w, rvec_c, tvec_c,
+                                                     K_cam, np.zeros(5))
+                        u, v = pts2d.reshape(-1, 2)[0]
+                        if not (np.isfinite(u) and np.isfinite(v)):
+                            continue
+                        cv2.circle(img, (int(u), int(v)), 6, col, -1)
+                        cv2.circle(img, (int(u), int(v)), 7, (0, 0, 0), 1)
+                        cv2.putText(img, lbl, (int(u) + 8, int(v) + 14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1)
+
+                # v2 setup-aid crosshairs:
+                #   * YELLOW (IDLE / AVERAGING): tentative T_sim_lab fit from
+                #     the CURRENT pelvis pose every frame. Where the operator
+                #     should place the box right NOW so that frame-0 alignment
+                #     is exact when SPACE is pressed.
+                #   * RED (PLAYBACK): T_sim_lab is committed. Shows where the
+                #     ref expects the box to be, using the COMMITTED T. If
+                #     the actual box (visible in the image) is far from this
+                #     mark, the alignment is poor and you should re-do SPACE.
+                if (v2_mode and motion_loader is not None
+                        and name in per_cam_origin_T):
+                    with phase_lock:
+                        ph_now = phase_state["phase"]
+                        T_committed = (phase_state["T_sim_lab"].copy()
+                                       if phase_state["T_sim_lab"] is not None
+                                       else None)
+
+                    def _project_lab_point(p_lab):
+                        T_cN_origin = per_cam_origin_T[name]
+                        K_cam = cam_state[name]["K"]
+                        rvec, _ = cv2.Rodrigues(T_cN_origin[:3, :3])
+                        tvec = T_cN_origin[:3, 3].astype(float)
+                        pts_3d = np.float32([p_lab]).reshape(-1, 3)
+                        pts_2d, _ = cv2.projectPoints(pts_3d, rvec, tvec,
+                                                     K_cam, np.zeros(5))
+                        u, v = pts_2d.reshape(-1, 2)[0]
+                        if not (np.isfinite(u) and np.isfinite(v)):
+                            return None
+                        return int(u), int(v)
+
+                    if ph_now in ("IDLE", "AVERAGING"):
+                        # Tentative pelvis-yaw T from current latch.
+                        with cam_latch_lock:
+                            pel_ok = cam_latch["pelvis_valid"]
+                            pp_lab = cam_latch["pelvis_pos"].copy()
+                            pR_lab = cam_latch["pelvis_R"].copy()
+                        if pel_ok:
+                            try:
+                                ref0 = motion_loader.at(0)
+                                T_tmp, _ = compute_T_sim_lab_pelvis_yaw(
+                                    pp_lab, pR_lab,
+                                    ref0.align_pos, ref0.align_R,
+                                    real_fwd_axis_tag_local=args.pelvis_tag_fwd_axis,
+                                    ref_fwd_axis_body_local=args.torso_forward_axis,
+                                )
+                                T_lab_sim_tmp = np.linalg.inv(T_tmp)
+                                target_box_lab = (T_lab_sim_tmp[:3, :3]
+                                                  @ ref0.object_pos
+                                                  + T_lab_sim_tmp[:3, 3])
+                                uv = _project_lab_point(target_box_lab)
+                                if uv is not None:
+                                    cx, cy = uv
+                                    if (0 <= cx < img.shape[1]
+                                            and 0 <= cy < img.shape[0]):
+                                        cv2.drawMarker(img, (cx, cy),
+                                                       (0, 255, 255),
+                                                       cv2.MARKER_CROSS, 24, 2)
+                                        cv2.circle(img, (cx, cy), 14,
+                                                   (0, 255, 255), 2)
+                                        cv2.putText(img, "place box here",
+                                                    (cx + 16, cy + 6),
+                                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                                    0.45, (0, 255, 255), 1)
+                            except Exception:
+                                pass
+                    elif ph_now == "PLAYBACK" and T_committed is not None:
+                        # Red crosshair: where committed-T predicts the
+                        # current ref box position to be, in lab coords.
+                        try:
+                            with phase_lock:
+                                tps = phase_state["t_play_start"]
+                            elapsed = time.monotonic() - tps
+                            fidx = max(0, min(
+                                int(round(elapsed / motion_loader.dt)),
+                                motion_loader.num_frames - 1))
+                            ref = motion_loader.at(fidx)
+                            T_lab_sim_committed = np.linalg.inv(T_committed)
+                            target_box_lab = (T_lab_sim_committed[:3, :3]
+                                              @ ref.object_pos
+                                              + T_lab_sim_committed[:3, 3])
+                            uv = _project_lab_point(target_box_lab)
+                            if uv is not None:
+                                cx, cy = uv
+                                if (0 <= cx < img.shape[1]
+                                        and 0 <= cy < img.shape[0]):
+                                    cv2.drawMarker(img, (cx, cy),
+                                                   (0, 0, 255),
+                                                   cv2.MARKER_CROSS, 28, 2)
+                                    cv2.circle(img, (cx, cy), 16,
+                                               (0, 0, 255), 2)
+                                    cv2.putText(img,
+                                                f"ref box @ frame {fidx}",
+                                                (cx + 18, cy + 6),
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                0.45, (0, 0, 255), 1)
+                        except Exception:
+                            pass
                 cv2.imshow(win, img)
 
         # Fused panel
@@ -1259,6 +1926,97 @@ try:
 
         py = 80
 
+        # v2 phase overlay (only when --motion-file is set)
+        if v2_mode:
+            with phase_lock:
+                ph        = phase_state["phase"]
+                t_start   = phase_state["t_play_start"]
+                t_avg     = phase_state["t_avg_start"]
+                n_avg     = len(phase_state["avg_pos_buf"])
+                diag      = phase_state["align_diag"]
+            if ph == "IDLE":
+                ph_str = ("v2 PHASE: IDLE  press SPACE when robot is at start pose"
+                          if motion_loader is not None else "v2 PHASE: IDLE")
+                ph_col = (0, 200, 255)
+                cv2.putText(panel, ph_str, (10, py), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, ph_col, 2)
+                py += 24
+            elif ph == "AVERAGING":
+                elapsed_avg = time.monotonic() - t_avg
+                ph_str = (f"v2 PHASE: AVERAGING  "
+                          f"{elapsed_avg:.1f}/{args.align_window_sec:.1f}s  "
+                          f"samples={n_avg}  (auto-PLAYBACK at end)")
+                ph_col = (0, 220, 220)
+                cv2.putText(panel, ph_str, (10, py), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, ph_col, 2)
+                py += 24
+            else:  # PLAYBACK
+                elapsed = time.monotonic() - t_start
+                fidx = max(0, min(int(round(elapsed / motion_loader.dt)),
+                                  motion_loader.num_frames - 1))
+                yaw_deg = (diag["delta_yaw_deg"]
+                           if diag and "delta_yaw_deg" in diag
+                           else (np.degrees(diag["delta_yaw_rad"])
+                                 if diag and diag.get("delta_yaw_rad") is not None
+                                 else None))
+                yaw_part = (f"  delta_yaw={yaw_deg:+.1f}deg"
+                            if yaw_deg is not None else "")
+                ph_str = (f"v2 PHASE: PLAYBACK  frame {fidx}/{motion_loader.num_frames-1}"
+                          f"  pkts={v2_packet_count}{yaw_part}")
+                cv2.putText(panel, ph_str, (10, py), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 255, 0), 2)
+                py += 24
+
+                # Residual line: show how close real (T-applied) is to ref.
+                # These are the same numbers the policy sees. Small = good.
+                with cam_latch_lock:
+                    snap_torso_valid = cam_latch["torso_valid"]
+                    snap_torso_pos   = cam_latch["torso_pos"].copy()
+                    snap_torso_R     = cam_latch["torso_R"].copy()
+                    snap_box_valid   = cam_latch["box_valid"]
+                    snap_box_pos     = cam_latch["box_pos"].copy()
+                    snap_box_R       = cam_latch["box_R"].copy()
+                with phase_lock:
+                    T_now = (phase_state["T_sim_lab"].copy()
+                             if phase_state["T_sim_lab"] is not None else None)
+                if T_now is not None and snap_torso_valid:
+                    try:
+                        ref = motion_loader.at(fidx)
+                        rt_pos, rt_R = transform_pose_lab_to_sim(
+                            T_now, snap_torso_pos, snap_torso_R, body_flip=True)
+                        if snap_box_valid:
+                            rb_pos, rb_R = transform_pose_lab_to_sim(
+                                T_now, snap_box_pos, snap_box_R, body_flip=False)
+                        else:
+                            rb_pos, rb_R = ref.object_pos, ref.object_R
+                        obs = compute_six_obs(
+                            rt_pos, rt_R, rb_pos, rb_R,
+                            ref.torso_pos, ref.torso_R, ref.object_pos, ref.object_R,
+                        )
+                        map_b = obs["motion_anchor_pos_b"]
+                        map_n = float(np.linalg.norm(map_b))
+                        opt   = obs["object_pos_torso"]
+                        rpt   = obs["ref_object_pos_torso"]
+                        opd   = float(np.linalg.norm(opt - rpt))
+                        cv2.putText(
+                            panel,
+                            f"  motion_anchor_pos_b="
+                            f"[{map_b[0]:+.3f},{map_b[1]:+.3f},{map_b[2]:+.3f}]"
+                            f" |.|={map_n*1000:.0f}mm",
+                            (10, py), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42, (180, 255, 180), 1)
+                        py += 18
+                        cv2.putText(
+                            panel,
+                            f"  obj_in_torso_real - ref="
+                            f"[{(opt-rpt)[0]:+.3f},{(opt-rpt)[1]:+.3f},"
+                            f"{(opt-rpt)[2]:+.3f}] |.|={opd*1000:.0f}mm",
+                            (10, py), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42, (180, 255, 180), 1)
+                        py += 18
+                    except Exception:
+                        pass
+
         def panel_line(label, T, color, extra=""):
             global py
             if T is None:
@@ -1274,29 +2032,63 @@ try:
             py += 18
 
         if args.show_robot_tags:
-            cv2.putText(panel, "Robot pose math (z-sign: +z=down, -z=up)",
+            cv2.putText(panel, "Robot poses (lab/origin frame)",
                         (10, py), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 255), 2)
             py += 22
-            head_src = "head_calib(npz)" if T_tag_torso is not None else f"head + z*{args.head_z_offset:+.2f}"
-            cv2.putText(panel, f"  torso_head = {head_src}", (10, py),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
-            py += 16
-            cv2.putText(panel, f"  root        = pelvis + z*{args.pelvis_to_root_z:+.2f}", (10, py),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
-            py += 16
-            cv2.putText(panel, f"  torso_pelvis= root + z*{args.root_to_torso_z:+.2f}", (10, py),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
-            py += 22
 
-            panel_line(f"head(id{ROBOT_HEAD_TAG_ID})", world_T_headtag, (255, 0, 255),
-                       extra=f"n_cams={head_n_cams}" if world_T_headtag is not None else "")
-            panel_line(f"pelvis(id{pelvis_used_id if pelvis_used_id>=0 else '-'})",
-                       world_T_pelvis, (0, 200, 255),
+            # Step 1: only pelvis tag (id 8) and the hardcoded-transform pelvis link.
+            # Legacy head/torso lines are kept under --show-legacy-pose-lines for
+            # backward-compat debugging (default OFF).
+            pelvis_tag_label = f"pelvis(id8 tag)"
+            panel_line(pelvis_tag_label, world_T_pelvis, (0, 200, 255),
                        extra=f"n_cams={pelvis_n_cams}" if world_T_pelvis is not None else "")
-            panel_line("root         ", world_T_root, (0, 200, 255))
-            panel_line("torso_head   ", world_T_torso_head, (255, 100, 255))
-            panel_line("torso_pelvis ", world_T_torso_pelvis, (255, 100, 255))
-            panel_line(f"torso({torso_path or '--'})", world_T_torso, (255, 0, 255))
+            panel_line("pelvis(estimated root)", world_T_pelvis_link, (0, 255, 0),
+                       extra="id8 + R_tag2body + offset(+5cm up, -7cm depth)"
+                             if world_T_pelvis_link is not None else "")
+
+            # Step 3: torso_link (multi-tag fusion of 9/12/13)
+            _tl_used = "|".join(str(t) for t in torso_link_diag.get("tags_used", []))
+            _tl_per = torso_link_diag.get("per_tag", {})
+            _tl_max_pos = max((d.get("residual_pos_m", 0.0) for d in _tl_per.values()),
+                              default=0.0)
+            _tl_max_rot = max((d.get("residual_rot_deg", 0.0) for d in _tl_per.values()),
+                              default=0.0)
+            tl_extra = (f"tags=[{_tl_used}] (n={torso_link_diag.get('n_tags', 0)}) "
+                        f"residual: dpos<={_tl_max_pos*100:.1f}cm "
+                        f"drot<={_tl_max_rot:.1f}deg"
+                        if world_T_torso_link is not None else "")
+            panel_line("torso_link FUSED", world_T_torso_link, (255, 200, 0),
+                       extra=tl_extra)
+            # Debug-only: per-tag breakdown + single-tag candidate lines.
+            # Hidden by default; enable via --show-torso-tag-debug.
+            if args.show_torso_tag_debug:
+                if len(_tl_per) >= 2:
+                    _tl_sort = sorted(_tl_per.keys(),
+                                      key=lambda k: (1 if isinstance(k, str) else 0, k))
+                    for tid in _tl_sort:
+                        d = _tl_per[tid]
+                        py_extra = (f"  {d['label']:<20} w={d['weight']:.1f}  "
+                                    f"dpos={d['residual_pos_m']*100:5.1f}cm  "
+                                    f"drot={d['residual_rot_deg']:5.1f}deg")
+                        cv2.putText(panel, py_extra, (10, py),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
+                        py += 16
+                panel_line("torso(id9 only)",  head9_T_torso,    (255, 255,   0))
+                panel_line("torso(id8 FK)",    pelvis8_T_torso,  (255,   0, 255))
+                panel_line("torso(id12 only)", back12_T_torso,   (  0, 165, 255))
+                panel_line("torso(id13 only)", front13_T_torso,  (  0, 255,   0))
+
+            if args.show_legacy_pose_lines:
+                py += 6
+                cv2.putText(panel, "Legacy paths (z-sign: +z=down, -z=up)",
+                            (10, py), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
+                py += 16
+                panel_line(f"head(id{ROBOT_HEAD_TAG_ID})", world_T_headtag, (255, 0, 255),
+                           extra=f"n_cams={head_n_cams}" if world_T_headtag is not None else "")
+                panel_line("root         ", world_T_root, (180, 180, 180))
+                panel_line("torso_head   ", world_T_torso_head, (180, 180, 180))
+                panel_line("torso_pelvis ", world_T_torso_pelvis, (180, 180, 180))
+                panel_line(f"torso({torso_path or '--'})", world_T_torso, (180, 180, 180))
             py += 6
 
         cv2.putText(panel, "Object", (10, py), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
@@ -1351,6 +2143,20 @@ try:
             })
             row.update(fill_pose("head", world_T_headtag))
             row.update(fill_pose("pelvis", world_T_pelvis))
+            row.update(fill_pose("pelvis_link", world_T_pelvis_link))
+            row.update(fill_pose("torso_link", world_T_torso_link))
+            row["torso_link_n_tags"] = int(torso_link_diag.get("n_tags", 0))
+            row["torso_link_tags_used"] = "|".join(
+                str(t) for t in torso_link_diag.get("tags_used", []))
+            _per_tag = torso_link_diag.get("per_tag", {})
+            if _per_tag:
+                row["torso_link_residual_max_pos_m"] = float(max(
+                    d.get("residual_pos_m", 0.0) for d in _per_tag.values()))
+                row["torso_link_residual_max_rot_deg"] = float(max(
+                    d.get("residual_rot_deg", 0.0) for d in _per_tag.values()))
+            else:
+                row["torso_link_residual_max_pos_m"] = 0.0
+                row["torso_link_residual_max_rot_deg"] = 0.0
             row.update(fill_pose("root", world_T_root))
             row.update(fill_pose("torso_head", world_T_torso_head))
             row.update(fill_pose("torso_pelvis", world_T_torso_pelvis))
@@ -1372,15 +2178,35 @@ try:
             stage_acc = {k: 0.0 for k in stage_acc}
             stage_n = 0
 
-        if (cv2.waitKey(1) & 0xFF) in (27, ord('q')):
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord('q')):
             break
+        if v2_mode and key == ord(' '):
+            with phase_lock:
+                cur = phase_state["phase"]
+            if cur == "IDLE":
+                ok, msg = _try_start_averaging()
+                print(f"[multicam-v2] SPACE: {msg}" if ok
+                      else f"[multicam-v2] SPACE ignored: {msg}")
+            elif cur == "AVERAGING":
+                _back_to_idle()
+                print("[multicam-v2] SPACE: AVERAGING aborted -> IDLE")
+            else:  # PLAYBACK
+                _back_to_idle()
+                print("[multicam-v2] SPACE: PLAYBACK -> IDLE (ref clock reset)")
 finally:
+    if ref_ticker_thread is not None:
+        ref_ticker_running = False
+        ref_ticker_thread.join(timeout=1.0)
     if detect_executor is not None:
         detect_executor.shutdown(wait=True)
     if udp_sock is not None:
         try:
             udp_sock.close()
-            print(f"[multicam] UDP packets sent: {udp_packet_count}")
+            if v2_mode:
+                print(f"[multicam-v2] v2 UDP packets sent: {v2_packet_count}")
+            else:
+                print(f"[multicam] UDP packets sent: {udp_packet_count}")
         except OSError:
             pass
     pipeline1.stop()

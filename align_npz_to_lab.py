@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """Align reference motion npz into the lab/origin frame defined by a shadow CSV.
 
+LEGACY / DIAGNOSTIC — superseded by the runtime alignment publisher.
+
+The supported runtime path for `Mimic_Sub8_45_TagHistory` is now to run
+`track_robot_and_box_multicam.py --motion-file <raw npz> --udp-publish` and
+press SPACE in the tracker window when the robot is at the start pose. The
+publisher computes T_sim_lab live (mathematically the inverse of the
+T_lab_world this script produces) and emits the 6 actor obs in NPZ sim
+frame, so no pre-aligned NPZ is needed at deploy time.
+
+This script is kept for two purposes:
+  1. Offline sanity check: run it on a saved start-pose CSV and inspect
+     the printed `post_align_*_err_*` numbers to confirm whether the
+     yaw-only fit is feasible for that start pose (large rotation error =
+     start pose roll/pitch is too far from NPZ frame 0).
+  2. Backward compatibility: if you ever need to deploy the old C++ obs
+     code path that consumed a pre-aligned NPZ, this script still produces
+     the right output. The current `unitree_rl_mjlab/deploy/.../State_Mimic`
+     reads obs from the v2 publisher when one is connected and only falls
+     back to MotionLoader_ for motion-only mimic policies.
+
+Math reference (still correct):
 This script computes a single 4x4 rigid transform T_lab_world such that:
 
     T_lab_world @ T_world_torso_npz_frame_F  ==  T_lab_torso_csv_mean

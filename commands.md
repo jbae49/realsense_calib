@@ -180,12 +180,18 @@ python track_robot_and_box_multicam.py \
 - `--show-box-tags` : 박스 태그별 candidate 다 표시.
 - `--no-show-axes` : 카메라 이미지에 RGB 축 그리기 끄기.
 
-### Tag-history 정책용: 카메라 → 정책 UDP 송신
+### Tag-history 정책용: 카메라 → 정책 UDP 송신 (v2 publisher, runtime alignment)
 
-`sub8_45_tag_history` 정책은 카메라가 추정한 torso/box pose 를 매 step 마다 정책에 공급해야 함. 트래커에 `--udp-publish` 만 추가하면 매 프레임 ASCII UDP 패킷을 보냄. **PC-only 모드 (권장)** 에선 default `--udp-host 127.0.0.1` 그대로 쓰면 됨:
+`sub8_45_tag_history` 정책은 카메라가 추정한 torso/box pose 와 NPZ ref motion 을 결합해 6 개 actor obs 를 만들어야 함. **새 v2 publisher 모드** 에선 트래커가 이 모든 작업을 자체 처리:
+
+1. `--motion-file <raw npz>` 로 NPZ 를 트래커가 직접 로드 (deploy.yaml 이 가리키는 raw `_extended.npz`).
+2. 트래커는 `IDLE` 상태로 시작해 NPZ frame-0 의 ref pose / joint 값을 그대로 50 Hz 로 송신 → policy 는 "완벽히 frame 0 추적" 으로 보고 가만히 서있음.
+3. 카메라가 floor tag 와 head tag 를 둘 다 잘 잡으면 OpenCV 창에 **노란색 십자가** 가 떠서 "박스를 여기에 두라" 고 알려줌 (NPZ frame-0 의 박스 위치를 현재 torso 기준으로 lab frame 에 투영).
+4. 로봇이 시작 자세에서 안정화된 다음 트래커 창 (어느 cv 창이든) 포커스에서 **SPACE** 를 누르면 그 순간의 real torso pose vs NPZ frame-0 으로 `T_sim_lab` 을 계산하고 `PLAYBACK` 으로 진입. 이후 매 50 Hz tick 마다 frame_idx 가 1 씩 증가하면서 ref motion 이 진행되고, 카메라가 본 real torso/box 는 `T_sim_lab` 으로 sim frame 으로 변환되어 6 obs 가 계산됨.
+5. 다시 SPACE → IDLE 로 복귀 (ref clock reset). PLAYBACK 끝까지 가면 마지막 frame 에 freeze.
 
 ```bash
-# PC-only (g1_ctrl 도 같은 PC에서 실행)
+# PC-only (권장, g1_ctrl 도 같은 PC)
 python track_robot_and_box_multicam.py \
   --cam1-serial 935322072654 --cam2-serial 115222071236 --cam3-serial 112322072671 \
   --cam1-calib camera1_935322072654_calibration.npz \
@@ -193,27 +199,33 @@ python track_robot_and_box_multicam.py \
   --cam3-calib camera3_112322072671_calibration.npz \
   --origin-id 1 --anchor-ids 10 --margin-min 20 \
   --detector-quad-decimate 1.5 \
-  --no-show-cam-windows \
   --udp-publish \
+  --motion-file unitree_rl_mjlab/deploy/robots/g1/config/policy/mimic/sub8_45/params/sub8_largebox_045_original_extended.npz \
+  --align-mode yaw-only \
   --csv-out outputs/sub8_45_taghist.csv --print-every 30
 ```
 
-```bash
-# Split-machine (g1_ctrl 을 Jetson 에서 실행하는 옵션)
-python track_robot_and_box_multicam.py ... \
-  --udp-publish --udp-host 192.168.123.164 --udp-port 9999
-```
+> **운영 순서**:
+> 1. 위 트래커를 먼저 띄움.
+> 2. 트래커 창에 `v2 PHASE: IDLE  press SPACE when robot is at start pose` 가 보이는지 확인.
+> 3. (선택) 로봇 자세를 보면서 카메라 창의 **노란 십자가** 위치에 박스를 정확히 배치 → `obj_pos_err` 0 에 가까워짐.
+> 4. 다른 터미널에서 `g1_ctrl` 시작. 컨트롤러로 FixStand → Velocity → R1+Y (`Mimic_Sub8_45_TagHistory`).
+> 5. 로봇이 stand 자세로 안정되면 트래커 창 포커스에서 **SPACE** → motion 시작.
 
 옵션:
-- `--udp-publish` : 송신 활성화 (기본 OFF, tag-history 정책 외에는 불필요).
-- `--udp-host` : 송신 대상. **기본 `127.0.0.1`** (PC-only). Jetson 모드면 `192.168.123.164`.
-- `--udp-port` : 기본 9999. deploy 측 `CAMERA_POSE_PORT` env 와 일치해야 함.
+- `--motion-file <npz>` : v2 모드 활성화 (여기에 raw sim-frame NPZ 경로). 비워두면 v1 (legacy) 모드.
+- `--align-mode {yaw-only, full-rotation}` : default `yaw-only` (gravity-preserving). `full-rotation` 은 시작 자세 roll/pitch 까지 baked in 되니 위험.
+- `--anchor-body-idx` : 기본 15 (= G1 30-body depth-first order 의 `torso_link`).
+- `--torso-forward-axis` : 기본 `+x` (G1 torso local).
+- `--ref-fps` : 기본 50 (policy step_dt=0.02 와 일치).
+- `--udp-publish` / `--udp-host` / `--udp-port` : 기존과 동일.
 
-종료 시 콘솔에 `[multicam] UDP packets sent: <N>`. 수신 측 `g1_ctrl` 의 `[cam]` 로그 `recv_count` 와 비슷하면 손실 거의 없음 (loopback 이면 1:1 에 가까움).
+종료 시 트래커 콘솔에 `[multicam-v2] v2 UDP packets sent: <N>`. 수신 측 `g1_ctrl` 의 warm-up 로그가 `format=v2` 로 떠야 정상.
 
-**Wire format**: ASCII 한 줄 = `<ts_ns> <torso_v> <tx><ty><tz> <tqw><tqx><tqy><tqz> <box_v> <bx><by><bz> <bqw><bqx><bqy><bqz>\n` (17 fields, ~150 bytes). 좌표는 lab frame 그대로.
+**v2 wire format**: ASCII 한 줄 (≈750 bytes) =
+`v2 <ts_ns> <phase 0|1> <frame_idx> <num_frames> <dof> <jp_0..28> <jv_0..28> <map_x map_y map_z> <mao_0..5> <opt_x opt_y opt_z> <oot_0..5> <rpt_x rpt_y rpt_z> <rot_0..5>\n`. 모든 좌표는 NPZ sim frame.
 
-> **Lab frame ↔ npz 정합**: deploy 측 `motion_file` 은 반드시 `align_npz_to_lab.py` 로 만든 v2 (정렬된) NPZ 사용. 시각 검증은 `python visualize_aligned_npz_mujoco.py --npz outputs/..._processed_v2.npz` 로 가능.
+> **legacy `align_npz_to_lab.py` + `_processed_v2.npz` 경로는 더 이상 필수 아님**. v2 publisher 가 같은 변환을 runtime 으로 수행. 옛 경로는 진단/온라인 미사용 deploy 호환을 위해 보존됨.
 
 ### 카메라 위치/세팅 가이드
 

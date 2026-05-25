@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "generated_at": "2026-05-24T21:25:00",
+    "method": "identity (skipped; tracker --box-inertial-quat already handles OBB->AABB)",
+    "rationale": "track_robot_and_box_multicam.py applies T_OBB_TO_BODY (= inverse of largebox.xml inertial.quat) before publishing obj_quat_*, so the CSV poses are already in mjlab AABB body frame. The residual rotation observed at step 2 (~9 deg in this calibration) is attributed primarily to operator-side box placement error rather than a fixed convention mismatch. Re-run a dedicated multi-orientation calibration only if the policy fails to track the object at deploy.",
+    "applies_to": "object_R_lab from tracker -> object_R_sim via R_sim = (T_sim_lab.R @ object_R_lab) @ R_obj_tag",
+    "convention": "R_obj_tag is right-multiplied on the body-frame rotation."
+  },
+  "R_obj_tag_3x3": [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "q_obj_tag_wxyz": [1.0, 0.0, 0.0, 0.0]
+}

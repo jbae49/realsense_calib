@@ -1,0 +1,7 @@
+Maximum number of clients reached
+qt.qpa.xcb: could not connect to display :1
+qt.qpa.plugin: Could not load the Qt platform plugin "xcb" in "/home/roy/anaconda3/envs/unitree_rl_mjlab/lib/python3.11/site-packages/cv2/qt/plugins" even though it was found.
+This application failed to start because no Qt platform plugin could be initialized. Reinstalling the application may fix this problem.
+
+Available platform plugins are: xcb.
+
